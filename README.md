@@ -43,6 +43,57 @@ $L --name test-my-session destroy --yes
 
 `clone` uses the configured clean VM; `clone NAME --from STOPPED_VM` selects another clean source. Cloning shares disk blocks initially, but changes consume storage. `destroy --yes` deletes only the selected owned working VM. Clean-image ownership records are protected from start, destroy and reset. Use `reset --yes` only on your working VM; it replaces that VM from its recorded stopped clean source. Do not select the clean image for destructive commands.
 
+## Share the two running slots
+
+Use the same runtime state directory for sessions sharing the queue. `start --wait`
+creates a persistent FIFO ticket and launches a detached worker with no stdin or
+terminal dependency. Killing the calling shell/waiter does not cancel the ticket:
+the worker still starts that private VM when its turn arrives, until the original
+waiting deadline expires. Boot readiness is checked separately after admission.
+A retry for that name keeps its original place, owner, and deadline; extending
+`--wait` on a retry does not jump or prolong the queue. `--detach` returns as soon
+as the ticket is saved; use `status --json` to confirm the request phase is `running` before guest commands.
+
+```sh
+export LAMPVM_NAME=test-my-session
+L=./bin/lampvm
+$L start --wait 3600 --owner "scenario session" --detach
+$L status                 # all holders, start times, idle time, queue order/age
+$L status --json          # timestamps, last command, active work, logs, deadlines
+# Once running, declare a long scenario that runs inside the guest:
+$L hold --seconds 3600 --reason "40-minute scenario driven inside the guest"
+$L exec /path/to/scenario # foreground exec/sh are tracked while they run
+$L release-hold
+$L stop                   # only your private VM; also cancels its queued start
+$L destroy --yes
+```
+
+The worker flags a holder after 10 minutes without a guest command (adjust with
+`start --idle-after SECONDS`). It records attention transitions in the ticket's
+log and shows the flag in `status`. It **never stops a VM for silence**: a quiet
+guest could be doing legitimate work. A live lampvm command, including a long
+`exec`, `sh`, wait, transfer or recording, suppresses the idle flag. A timed hold
+suppresses it for autonomous guest jobs even if their host driving process dies;
+after the hold expires, the worker flags command silence again. A flag means
+“inspect your own session”, not “the guest is safe to kill”. Status polling does
+not refresh usage. Stop/destroy your own clone when finished.
+
+`cancel-start` removes only the selected owned VM's queued request, without
+stopping a VM. Admission in progress completes under its lifecycle lock before
+cancellation can run. Expired/cancelled tickets no longer block the line. Immediate
+`start` cannot jump ahead of waiters. The status includes unowned/older running
+VMs as holders with unknown owner/start/activity, and cannot infer an ETA for
+guests with arbitrary jobs.
+
+If a detached worker itself is killed, status marks it stalled. Rerun `start`
+with the same name to recover the saved ticket (or the monitor for an already
+running managed VM). Its waiting deadline still counts elapsed wall time. Host
+restart does not restart workers; retry unexpired tickets explicitly. Workers
+exit when their VM stops. There is no background shutdown/reaping service.
+The FIFO applies to this runtime state's updated `start` commands; old binaries,
+other state directories, direct Tart and provisioning `setup --wait-slot` do not
+participate. All local running VMs still count toward the two-slot capacity.
+
 ## Drive an app
 
 Apps are explicit by default. Set `LAMPVM_NAME` to select your private guest without repeating `--name`. A command accepting `[APP]` requires either an app argument or a configured default app. Use an installed app's process name, usually its bundle name without `.app`.
@@ -74,9 +125,11 @@ Global selection: `--name NAME`, `--config FILE`, `--state-dir DIRECTORY`. Envir
 | `setup` | Downloads dependencies, builds tools and prepares the guest and clean image. `--from VM` uses a stopped local source. |
 | `build` | Builds the host lock-state and guest input/inspection helpers into external state. |
 | `doctor` | Checks host dependencies, Accessibility and reported guest health, including unfinished Setup Assistant. It does not prove video consent or every interaction. |
-| `start [--wait SECONDS]` | Starts the selected VM without a host window, audio or shared clipboard, and waits for its desktop. Waits for a free slot if requested. |
+| `start [--wait SECONDS] [--detach]` | Durable FIFO admission, detached boot worker and idle observation. Default waits for the desktop; `--owner` labels the session. |
 | `stop` | Shuts down the selected VM, then forces it off if graceful shutdown times out. |
-| `status` | Reports VM state/configuration and host lock state. |
+| `status [--json]` | Shows every local slot holder, activity/holds, worker health and FIFO line; includes host lock state if built. |
+| `cancel-start` | Cancels only the selected owned VM’s queued start. |
+| `hold --seconds N --reason TEXT` / `release-hold` | Declares/clears autonomous guest work; protects it from idle flags. |
 | `apps` | Lists running guest apps with process names, bundle IDs, PIDs and frontmost status. |
 | `ocr [--app APP]` | Reads visible text with offline Apple Vision OCR, including confidence and text boxes in image pixels. App captures include `screenOriginPoints` and `pixelsPerPoint` conversion; boxes have a top-left image origin. |
 | `clone NAME [--from VM]` | Creates a separate working VM from a stopped clean source. |
@@ -141,6 +194,6 @@ bin/lampvm --config config/lamp.json --name test-my-session launch
 
 `tests/build-harness.sh` builds an offline, ad hoc signed AppKit app under ignored `build/`. It provides a click counter, text field, delayed/hidden element, 60 scrolling rows, a drag source/drop target and a right-click context menu. Install it into a disposable private clone, test the commands through the actual guest, and capture cropped proof. No personal app or account is needed. The visible scroll-offset label verifies that wheel input moved the viewport even when Accessibility exposes offscreen rows.
 
-Run host-side tests with `python3 -m unittest discover tests`. These check wrapper behaviour without substituting for VM tests. `tests/smoke.py` drives the harness through a running private VM and saves command output plus cropped screenshots/recording; read its help before running it. Start only your own prepared VM, set its name/state explicitly and delete that clone after proof.
+Run host-side tests with `python3 -m unittest discover -s tests -v`. The slot suite launches real CLI/worker processes against an isolated fake Tart, kills waiters/workers, checks recovery/FIFO/expiry/cancellation and verifies idle flags without stopping guest jobs. These check wrapper behaviour without substituting for VM tests. `tests/smoke.py` drives the harness through a running private VM and saves command output plus cropped screenshots/recording; read its help before running it. Start only your own prepared VM, set its name/state explicitly and delete that clone after proof.
 
 Keep proof, compiled apps, logs and recordings outside the repository. Read the migration notes in [docs/MIGRATION.md](docs/MIGRATION.md) before replacing an existing installation that other sessions use.

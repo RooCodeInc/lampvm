@@ -16,6 +16,7 @@ import uuid
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
 from bootstrap import complete_desktop
+from slots import Slots
 
 
 class Error(Exception):
@@ -166,44 +167,93 @@ class VM:
             raise Error("Specify APP or configure app; there is no app-specific default")
         return app
 
-    def start(self, wait_seconds):
+    def start(self, wait_seconds, owner=None, idle_after=600, detach=False):
         self.working()
-        if self.running():
-            print("already running: " + self.name)
+        slots = Slots(self.state)
+        already_running = self.running()
+        existing = slots.snapshot()['requests'].get(self.name)
+        if already_running and (not existing or existing['phase'] not in ('running', 'failed', 'booting', 'queued')):
+            print("already running: " + self.name + "; activity untracked until next managed start")
             return
-        deadline = time.monotonic() + wait_seconds
-        # This lock serializes starts by this toolkit. Tart remains the final arbiter
-        # when other VM runners race it for a slot.
+        # Do not let an immediate start jump ahead of durable waiters.
+        # Durable waits are saved immediately, even while another VM boots.
+        # Only a no-wait admission needs a host capacity check here.
+        admission = lock(self.state / "locks/host-start.lock", timeout=0) if not wait_seconds and not already_running else contextlib.nullcontext()
+        with admission:
+            existing = slots.snapshot()['requests'].get(self.name)
+            resuming = existing and (existing['phase'] == 'booting' or
+                                     existing['phase'] == 'queued' and existing['expires_at'] > time.time())
+            if not wait_seconds and not resuming and not already_running:
+                if slots.waiting(slots.snapshot(), time.time()) or sum(
+                        bool(v.get("Running")) for v in self.machines() if v.get("Source") == "local") >= 2:
+                    raise Error("Slots busy or queued; use start --wait SECONDS; status shows holders and line")
+            request = existing if already_running else slots.enqueue(
+                self.name, wait_seconds or 30, owner or self.name, self.config, self.tart, idle_after)
+        logdir = self.state / "logs"
+        logdir.mkdir(parents=True, exist_ok=True)
+        logfile = logdir / (self.name + "-slot-" + request['id'] + ".log")
+        slots.update_request(self.name, request['id'], log=str(logfile))
+        with logfile.open('ab') as stream:
+            subprocess.Popen([sys.executable, str(ROOT / "lib/slots_worker.py"),
+                              str(self.state), self.name, request['id']],
+                             stdin=subprocess.DEVNULL, stdout=stream, stderr=subprocess.STDOUT,
+                             start_new_session=True)
+        print("ticket: " + request['id'] + "; log: " + str(logfile), flush=True)
+        if detach:
+            return
+        previous = None
         while True:
-            with lock(self.state / "locks/host-start.lock"):
-                if sum(bool(v.get("Running")) for v in self.machines() if v.get("Source") == "local") < 2:
-                    logdir = self.state / "logs"
-                    logdir.mkdir(parents=True, exist_ok=True)
-                    logfile = logdir / (self.name + "-" + uuid.uuid4().hex + ".log")
-                    with logfile.open("wb") as stream:
-                        proc = subprocess.Popen([str(self.tart), "run", "--no-graphics", "--no-audio", "--no-clipboard", self.name], stdin=subprocess.DEVNULL, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
-                    boot_deadline = time.monotonic() + 120
-                    while time.monotonic() < boot_deadline:
-                        if proc.poll() is not None:
-                            raise Error("Tart exited during boot; inspect " + str(logfile))
-                        try:
-                            ready = subprocess.run([str(self.tart), "exec", self.name, "/usr/bin/pgrep", "-q", "Dock"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
-                        except subprocess.TimeoutExpired:
-                            ready = None
-                        if ready and ready.returncode == 0:
-                            self.control("trusted", capture=True)
-                            complete_desktop(self.tart, self.name, self.ctl)
-                            issues = self.health()
-                            if issues:
-                                raise Error("; ".join(issues) + "; the owned VM remains running for inspection")
-                            print("running: " + self.name)
-                            return
-                        time.sleep(1)
-                    raise Error("Boot timed out; inspect " + str(logfile) + "; the owned VM may still be running")
-            if time.monotonic() >= deadline:
-                raise Error("Both macOS VM slots are busy; use start --wait SECONDS. No other VM was stopped.")
-            print("waiting for a free VM slot", file=sys.stderr)
-            time.sleep(min(5, max(0, deadline - time.monotonic())))
+            data = slots.snapshot()
+            current = data['requests'].get(self.name)
+            if not current or current['id'] != request['id']:
+                raise Error("Start request replaced or removed; inspect status")
+            phase = current['phase']
+            if phase == 'running':
+                print("running: " + self.name)
+                return
+            if phase in ('failed', 'expired', 'cancelled', 'stopped'):
+                raise Error("Start " + phase + ": " + current.get('error', 'see status and ' + str(logfile)))
+            queue = slots.waiting(data, time.time())
+            position = next((i for i, r in enumerate(queue, 1) if r['id'] == request['id']), None)
+            message = (phase, position)
+            if message != previous:
+                print("start %s; queue position %s; waited %.0fs; expires in %.0fs; ETA unknown" %
+                      (phase, position or '-', time.time()-request['enqueued_at'],
+                       max(0, request['expires_at']-time.time())), file=sys.stderr, flush=True)
+                previous = message
+            heartbeat = current.get('heartbeat') or request['enqueued_at']
+            if time.time() - heartbeat > (240 if phase == 'booting' else 30):
+                raise Error("Detached worker stalled; rerun start to resume the same ticket/place")
+            time.sleep(1)
+
+    def boot(self, on_launch=lambda: None):
+        """Called only with the VM lifecycle and host-start locks held."""
+        self.working()
+        proc = None
+        logfile = self.state / "logs"
+        if not self.running():
+            logfile.mkdir(parents=True, exist_ok=True)
+            logfile = logfile / (self.name + "-" + uuid.uuid4().hex + ".log")
+            with logfile.open("wb") as stream:
+                proc = subprocess.Popen([str(self.tart), "run", "--no-graphics", "--no-audio", "--no-clipboard", self.name], stdin=subprocess.DEVNULL, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
+        on_launch()
+        boot_deadline = time.monotonic() + 120
+        while time.monotonic() < boot_deadline:
+            if proc is not None and proc.poll() is not None:
+                raise Error("Tart exited during boot; inspect " + str(logfile))
+            try:
+                ready = subprocess.run([str(self.tart), "exec", self.name, "/usr/bin/pgrep", "-q", "Dock"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            except subprocess.TimeoutExpired:
+                ready = None
+            if ready and ready.returncode == 0:
+                self.control("trusted", capture=True)
+                complete_desktop(self.tart, self.name, self.ctl)
+                issues = self.health()
+                if issues:
+                    raise Error("; ".join(issues) + "; the owned VM remains running for inspection")
+                return
+            time.sleep(1)
+        raise Error("Boot timed out; inspect " + str(logfile) + "; the owned VM may still be running")
 
     def stop(self):
         self.owned()
@@ -318,8 +368,17 @@ def parser():
     add("doctor", "check host dependencies and guest permissions")
     q = add("start", "boot an owned VM headlessly")
     q.add_argument("--wait", type=float, default=0, help="seconds to wait for a VM slot")
+    q.add_argument("--owner", help="session label shown beside holder and ticket")
+    q.add_argument("--idle-after", type=float, default=600, help="flag command silence after seconds; never stops the VM")
+    q.add_argument("--detach", action="store_true", help="return after queuing; detached worker starts and monitors the VM")
     add("stop", "shut down only the selected owned VM")
-    add("status", "show VM and host lock state")
+    q = add("status", "show all slot holders and durable FIFO queue")
+    q.add_argument("--json", action="store_true")
+    add("cancel-start", "cancel only the selected VM's queued start")
+    q = add("hold", "declare guest work without lampvm commands")
+    q.add_argument("--seconds", type=float, required=True)
+    q.add_argument("--reason", required=True)
+    add("release-hold", "clear selected VM's declared hold")
     add("apps", "list guest applications and their process names")
     app_option(add("ocr", "read visible text and image coordinates with offline Vision OCR"))
     q = add("clone", "make a private stopped VM from a stopped source")
@@ -434,7 +493,7 @@ def main():
     vm.require_tart()
     # Recording and waits deliberately release the action lock so another call
     # can cause the change they observe. Captures have unique names on both sides.
-    unlocked = cmd in ["record", "wait", "assert", "status", "tree", "find", "windows", "bounds"]
+    unlocked = cmd in ["start", "record", "wait", "assert", "status", "tree", "find", "windows", "bounds"]
     lifecycle_names = [vm.name]
     if cmd == "clone":
         lifecycle_names = [valid_name(args.target), valid_name(args.source or vm.clean)]
@@ -445,16 +504,52 @@ def main():
         if cmd == "start":
             if not math.isfinite(args.wait) or not 0 <= args.wait <= 86400:
                 raise Error("--wait must be finite and 0..86400 seconds")
-            vm.start(args.wait)
+            if not math.isfinite(args.idle_after) or not 1 <= args.idle_after <= 86400:
+                raise Error("--idle-after must be finite and 1..86400 seconds")
+            vm.start(args.wait, args.owner, args.idle_after, args.detach)
+            return
+        if cmd == "cancel-start":
+            vm.working()
+            Slots(vm.state).cancel(vm.name)
+            print("cancelled queued start: " + vm.name)
+            return
+        if cmd in ("hold", "release-hold"):
+            vm.need()
+            seconds = args.seconds if cmd == "hold" else 0
+            if cmd == "hold" and (not math.isfinite(seconds) or not 1 <= seconds <= 86400 or not args.reason.strip()):
+                raise Error("hold requires 1..86400 finite seconds and a nonempty reason")
+            Slots(vm.state).hold(vm.name, seconds, args.reason if cmd == "hold" else "")
+            print("hold updated: " + vm.name)
             return
         if cmd == "stop":
+            Slots(vm.state).cancel(vm.name)
             vm.stop()
+            Slots(vm.state).stopped(vm.name)
             return
         if cmd == "status":
-            print(json.dumps([v for v in vm.machines() if v["Name"] in [vm.name, vm.clean]], indent=2))
+            report = Slots(vm.state).report(vm.machines())
             helper = vm.state / "bin/lockstate"
             if helper.exists():
-                print("host screen: " + output([helper]))
+                report['host_screen'] = output([helper])
+            if args.json:
+                print(json.dumps(report, indent=2))
+            else:
+                print("Slots: %s/2 running. ETA unknown." % len(report['holders']))
+                for holder in report['holders']:
+                    since = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(holder['started_at'])) if holder.get('started_at') else 'unknown'
+                    print("  %s | owner %s | since %s | idle %ss | %s | monitor %s" %
+                          (holder['name'], holder.get('owner', 'unknown'), since,
+                           holder['idle_seconds'] if holder['idle_seconds'] is not None else '?', holder['attention'], holder['monitor']))
+                print("Queue:")
+                for ticket in report['queue']:
+                    print("  #%s %s | owner %s | waited %ss | remaining %ss | %s" %
+                          (ticket['position'], ticket['name'], ticket['owner'], ticket['waited_seconds'],
+                           ticket['remaining_seconds'], ticket['worker']))
+                if not report['queue']:
+                    print("  empty")
+                for request in report['requests']:
+                    if request['phase'] in ('booting', 'failed', 'expired', 'cancelled'):
+                        print("  %s: %s %s" % (request['name'], request['phase'], request.get('error', '')))
             return
         if cmd == "clone":
             target = valid_name(args.target)
@@ -477,7 +572,9 @@ def main():
             return
         if cmd == "destroy":
             vm.working()
+            Slots(vm.state).cancel(vm.name)
             vm.stop()
+            Slots(vm.state).stopped(vm.name)
             vm.t("delete", vm.name)
             vm.marker().unlink()
             print("deleted: " + vm.name)
@@ -490,26 +587,29 @@ def main():
             source = [v for v in vm.machines() if v["Name"] == clean and v.get("Source") == "local"]
             if not source or source[0].get("Running"):
                 raise Error("Clean copy must exist and be stopped")
+            Slots(vm.state).cancel(vm.name)
             vm.stop()
+            Slots(vm.state).stopped(vm.name)
             vm.t("delete", vm.name)
             vm.t("clone", clean, vm.name)
             print("reset (stopped): " + vm.name)
             return
         vm.need()
-        if cmd in ["shot", "record"]:
-            if cmd == "record" and not 1 <= args.seconds <= 300:
-                raise Error("Record duration must be 1..300 seconds")
-            vm.artifact(args, cmd == "record")
-        elif cmd == "ocr":
-            vm.ocr(args)
-        elif cmd == "apps":
-            vm.control("apps")
-        elif cmd == "install":
-            src = Path(args.source).expanduser().resolve()
-            if not src.is_dir() or src.suffix != ".app" or not (src / "Contents/Info.plist").is_file():
-                raise Error("Install expects a built .app bundle with Contents/Info.plist")
-            vm.control("quit", src.stem)
-            script = '''set -eu
+        with Slots(vm.state).activity(vm.name, cmd):
+            if cmd in ["shot", "record"]:
+                if cmd == "record" and not 1 <= args.seconds <= 300:
+                    raise Error("Record duration must be 1..300 seconds")
+                vm.artifact(args, cmd == "record")
+            elif cmd == "ocr":
+                vm.ocr(args)
+            elif cmd == "apps":
+                vm.control("apps")
+            elif cmd == "install":
+                src = Path(args.source).expanduser().resolve()
+                if not src.is_dir() or src.suffix != ".app" or not (src / "Contents/Info.plist").is_file():
+                    raise Error("Install expects a built .app bundle with Contents/Info.plist")
+                vm.control("quit", src.stem)
+                script = '''set -eu
 staging=$(/usr/bin/mktemp -d /tmp/lampvm-install.XXXXXXXX)
 mkdir -p "$staging/new" "$staging/old"
 /usr/bin/tar -xf - -C "$staging/new"
@@ -517,90 +617,91 @@ mkdir -p "$staging/new" "$staging/old"
 mv -- "$staging/new/$1" /Applications/
 /usr/bin/xattr -cr "/Applications/$1"
 '''
-            vm.pipe_tar(src, script, src.name)
-            print("installed: " + src.name)
-        elif cmd == "launch":
-            app = vm.application(args.app)
-            path = "/Applications/" + app + ".app"
-            exists = subprocess.run([str(vm.tart), "exec", vm.name, "/bin/test", "-d", path]).returncode == 0
-            argv = ["/usr/bin/open", "-a", path if exists else app]
-            launch_args = args.args[1:] if args.args[:1] == ["--"] else args.args
-            if launch_args:
-                argv += ["--args", *launch_args]
-            vm.guest(*argv)
-        elif cmd == "quit":
-            vm.control("quit", vm.application(args.app))
-        elif cmd == "wipe":
-            wipe = vm.config.get("wipe", {})
-            domains, paths = wipe.get("preference_domains", []), wipe.get("paths", [])
-            if not domains and not paths:
-                raise Error("No wipe paths/domains configured; nothing removed")
-            if any(not re.fullmatch(r"[A-Za-z0-9._-]+", x) for x in domains):
-                raise Error("Invalid preference domain")
-            if any(not x.startswith(("Library/Application Support/", "Applications/")) or ".." in Path(x).parts for x in paths):
-                raise Error("Wipe paths must be relative app-data paths under Library/Application Support or Applications")
-            vm.control("quit", vm.application())
-            for domain in domains:
-                subprocess.run([str(vm.tart), "exec", vm.name, "/usr/bin/defaults", "delete", domain], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            script = 'set -eu; staging=$(mktemp -d /tmp/lampvm-wipe.XXXXXXXX); cd "$HOME"; for p in "$@"; do [[ ! -e "$p" ]] || mv -- "$p" "$staging/${RANDOM}-${p:t}"; done'
-            vm.guest("/bin/zsh", "-c", script, "lampvm", *paths)
-            print("wiped configured app preferences and data (not Keychain)")
-        elif cmd in ["tree", "windows", "bounds", "activate"]:
-            argv = [cmd, vm.application(args.app)]
-            if getattr(args, "json", False):
-                argv.append("--json")
-            vm.control(*argv)
-        elif cmd in ["find", "clickon", "press", "wait", "assert", "setvalue"]:
-            count = 2 if cmd == "setvalue" else 1
-            if len(args.operands) == count:
-                app, operands = vm.application(), args.operands
-            elif len(args.operands) == count + 1:
-                app, operands = args.operands[0], args.operands[1:]
-            else:
-                raise Error("Expected [APP] TEXT" + (" VALUE" if count == 2 else ""))
-            argv = [cmd, app, *operands]
-            for flag in ["exact", "json", "right", "absent"]:
-                if getattr(args, flag, False):
-                    argv.append("--" + flag)
-            if getattr(args, "index", None) is not None:
-                argv += ["--index", str(args.index)]
-            if args.role:
-                argv += ["--role", args.role]
-            if hasattr(args, "timeout"):
-                if not math.isfinite(args.timeout) or not 0 <= args.timeout <= 3600:
-                    raise Error("Timeout must be 0..3600 seconds")
-                argv += ["--timeout", str(args.timeout)]
-            vm.control(*argv)
-        elif cmd in ["click", "doubleclick", "rightclick", "move", "hit", "scroll", "drag", "type", "key"]:
-            if hasattr(args, "values"):
-                allowed = {"click": (2,), "doubleclick": (2,), "rightclick": (2,), "move": (2,), "hit": (2,), "scroll": (3, 4), "drag": (4, 5)}[cmd]
-                if len(args.values) not in allowed or not all(math.isfinite(v) and abs(v) <= 1_000_000 for v in args.values):
-                    raise Error("Wrong number of coordinates or numeric value outside +/-1000000")
-            if vm.app and cmd != "hit":
-                vm.control("activate", vm.app)
-            values = [args.text] if cmd == "type" else ([args.key] + ([args.modifiers] if args.modifiers else [])) if cmd == "key" else [str(x) for x in args.values]
-            vm.control(cmd, *values)
-        elif cmd == "exec":
-            if not args.args:
-                raise Error("exec needs a command")
-            vm.guest(*args.args)
-        elif cmd == "sh":
-            vm.t("exec", "-i", vm.name, "/bin/zsh", "-s")
-        elif cmd == "push":
-            vm.push(args.source, args.destination)
-            print("copied into guest: " + args.destination)
-        elif cmd == "pull":
-            dest = Path(args.destination).expanduser()
-            if dest.exists():
-                raise Error("Destination exists; choose a new filename")
-            partial = dest.with_name(dest.name + "." + uuid.uuid4().hex + ".partial")
-            try:
-                with partial.open("xb") as stream:
-                    vm.guest("/bin/cat", args.source, stdout=stream)
-                os.link(partial, dest)
-            finally:
-                partial.unlink(missing_ok=True)
-            print(str(dest))
+                vm.pipe_tar(src, script, src.name)
+                print("installed: " + src.name)
+            elif cmd == "launch":
+                app = vm.application(args.app)
+                path = "/Applications/" + app + ".app"
+                exists = subprocess.run([str(vm.tart), "exec", vm.name, "/bin/test", "-d", path]).returncode == 0
+                argv = ["/usr/bin/open", "-a", path if exists else app]
+                launch_args = args.args[1:] if args.args[:1] == ["--"] else args.args
+                if launch_args:
+                    argv += ["--args", *launch_args]
+                vm.guest(*argv)
+            elif cmd == "quit":
+                vm.control("quit", vm.application(args.app))
+            elif cmd == "wipe":
+                wipe = vm.config.get("wipe", {})
+                domains, paths = wipe.get("preference_domains", []), wipe.get("paths", [])
+                if not domains and not paths:
+                    raise Error("No wipe paths/domains configured; nothing removed")
+                if any(not re.fullmatch(r"[A-Za-z0-9._-]+", x) for x in domains):
+                    raise Error("Invalid preference domain")
+                if any(not x.startswith(("Library/Application Support/", "Applications/")) or ".." in Path(x).parts for x in paths):
+                    raise Error("Wipe paths must be relative app-data paths under Library/Application Support or Applications")
+                vm.control("quit", vm.application())
+                for domain in domains:
+                    subprocess.run([str(vm.tart), "exec", vm.name, "/usr/bin/defaults", "delete", domain], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                script = 'set -eu; staging=$(mktemp -d /tmp/lampvm-wipe.XXXXXXXX); cd "$HOME"; for p in "$@"; do [[ ! -e "$p" ]] || mv -- "$p" "$staging/${RANDOM}-${p:t}"; done'
+                vm.guest("/bin/zsh", "-c", script, "lampvm", *paths)
+                print("wiped configured app preferences and data (not Keychain)")
+            elif cmd in ["tree", "windows", "bounds", "activate"]:
+                argv = [cmd, vm.application(args.app)]
+                if getattr(args, "json", False):
+                    argv.append("--json")
+                vm.control(*argv)
+            elif cmd in ["find", "clickon", "press", "wait", "assert", "setvalue"]:
+                count = 2 if cmd == "setvalue" else 1
+                if len(args.operands) == count:
+                    app, operands = vm.application(), args.operands
+                elif len(args.operands) == count + 1:
+                    app, operands = args.operands[0], args.operands[1:]
+                else:
+                    raise Error("Expected [APP] TEXT" + (" VALUE" if count == 2 else ""))
+                argv = [cmd, app, *operands]
+                for flag in ["exact", "json", "right", "absent"]:
+                    if getattr(args, flag, False):
+                        argv.append("--" + flag)
+                if getattr(args, "index", None) is not None:
+                    argv += ["--index", str(args.index)]
+                if args.role:
+                    argv += ["--role", args.role]
+                if hasattr(args, "timeout"):
+                    if not math.isfinite(args.timeout) or not 0 <= args.timeout <= 3600:
+                        raise Error("Timeout must be 0..3600 seconds")
+                    argv += ["--timeout", str(args.timeout)]
+                vm.control(*argv)
+            elif cmd in ["click", "doubleclick", "rightclick", "move", "hit", "scroll", "drag", "type", "key"]:
+                if hasattr(args, "values"):
+                    allowed = {"click": (2,), "doubleclick": (2,), "rightclick": (2,), "move": (2,), "hit": (2,), "scroll": (3, 4), "drag": (4, 5)}[cmd]
+                    if len(args.values) not in allowed or not all(math.isfinite(v) and abs(v) <= 1_000_000 for v in args.values):
+                        raise Error("Wrong number of coordinates or numeric value outside +/-1000000")
+                if vm.app and cmd != "hit":
+                    vm.control("activate", vm.app)
+                values = [args.text] if cmd == "type" else ([args.key] + ([args.modifiers] if args.modifiers else [])) if cmd == "key" else [str(x) for x in args.values]
+                vm.control(cmd, *values)
+            elif cmd == "exec":
+                if not args.args:
+                    raise Error("exec needs a command")
+                vm.guest(*args.args)
+            elif cmd == "sh":
+                vm.t("exec", "-i", vm.name, "/bin/zsh", "-s")
+            elif cmd == "push":
+                vm.push(args.source, args.destination)
+                print("copied into guest: " + args.destination)
+            elif cmd == "pull":
+                dest = Path(args.destination).expanduser()
+                if dest.exists():
+                    raise Error("Destination exists; choose a new filename")
+                partial = dest.with_name(dest.name + "." + uuid.uuid4().hex + ".partial")
+                try:
+                    with partial.open("xb") as stream:
+                        vm.guest("/bin/cat", args.source, stdout=stream)
+                    os.link(partial, dest)
+                finally:
+                    partial.unlink(missing_ok=True)
+                print(str(dest))
+
 
 
 if __name__ == "__main__":
