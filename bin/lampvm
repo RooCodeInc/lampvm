@@ -1,0 +1,608 @@
+#!/usr/bin/env python3
+"""A shell interface to an isolated macOS desktop. No host GUI automation."""
+import argparse
+import contextlib
+import fcntl
+import json
+import math
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+import uuid
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+class Error(Exception):
+    pass
+
+
+def run(argv, **kwargs):
+    # Cloning must not silently prune another session's cached images.
+    kwargs.setdefault("env", {**os.environ, "TART_NO_AUTO_PRUNE": "1"})
+    result = subprocess.run([str(x) for x in argv], **kwargs)
+    if result.returncode:
+        raise Error("command failed (exit %s)" % result.returncode)
+    return result
+
+
+def output(argv):
+    return run(argv, stdout=subprocess.PIPE, text=True).stdout.strip()
+
+
+def valid_name(name):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", name):
+        raise Error("VM names must use letters, numbers, dot, dash or underscore (max 80)")
+    return name
+
+
+@contextlib.contextmanager
+def lock(path, timeout=120):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as handle:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise Error("VM is busy; lock wait timed out")
+                time.sleep(0.1)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def locks(state, names):
+    # Every lifecycle operation takes the same sorted order, including its source.
+    with contextlib.ExitStack() as stack:
+        for name in sorted(set(names)):
+            stack.enter_context(lock(state / "locks" / (valid_name(name) + ".lock")))
+        yield
+
+
+class VM:
+    def __init__(self, args):
+        self.state = Path(args.state_dir or os.environ.get("LAMPVM_STATE_DIR", "~/Library/Application Support/lampvm")).expanduser().resolve()
+        config_path = Path(args.config or os.environ.get("LAMPVM_CONFIG", str(self.state / "config.json"))).expanduser()
+        runtime = self.state / "config.json"
+        self.config = json.loads(runtime.read_text()) if runtime.exists() else {}
+        if not isinstance(self.config, dict):
+            raise Error("Runtime configuration must be a JSON object")
+        if (args.config or os.environ.get("LAMPVM_CONFIG")) and not config_path.is_file():
+            raise Error("Configuration file does not exist: " + str(config_path))
+        if config_path.exists() and config_path.resolve() != runtime.resolve():
+            overlay = json.loads(config_path.read_text())
+            if not isinstance(overlay, dict):
+                raise Error("Configuration must be a JSON object")
+            self.config.update(overlay)
+        self.name = valid_name(args.name or os.environ.get("LAMPVM_NAME") or self.config.get("vm", "lampvm"))
+        self.clean = valid_name(self.config.get("clean", "lampvm-clean"))
+        self.app = getattr(args, "app", None) or os.environ.get("LAMPVM_APP") or self.config.get("app")
+        self.tart = Path(os.environ.get("LAMPVM_TART", str(self.state / "tart/tart.app/Contents/MacOS/tart"))).expanduser()
+        self.ctl = None
+
+    def require_tart(self):
+        if not self.tart.is_file():
+            raise Error("Tart is missing; run lampvm setup")
+
+    def t(self, *args, **kwargs):
+        self.require_tart()
+        return run([self.tart, *args], **kwargs)
+
+    def tout(self, *args):
+        self.require_tart()
+        return output([self.tart, *args])
+
+    def machines(self):
+        return json.loads(self.tout("list", "--format", "json"))
+
+    def exists(self, name):
+        return any(v["Name"] == name and v.get("Source") == "local" for v in self.machines())
+
+    def running(self):
+        return any(v["Name"] == self.name and v.get("Source") == "local" and v.get("Running") for v in self.machines())
+
+    def marker(self, name=None):
+        return self.state / "vms" / (valid_name(name or self.name) + ".json")
+
+    def owned(self):
+        if not self.marker().is_file():
+            raise Error("This VM has no lampvm ownership record. Use setup or clone; existing VMs are never adopted automatically.")
+        marker = json.loads(self.marker().read_text())
+        if not isinstance(marker, dict) or marker.get("name") != self.name:
+            raise Error("Ownership record does not match the selected VM")
+
+    def working(self):
+        self.owned()
+        if json.loads(self.marker().read_text()).get("role") == "clean":
+            raise Error("Clean snapshots cannot be started, reset or destroyed with working-VM commands")
+
+    def need(self):
+        self.owned()
+        if not self.running():
+            raise Error("VM isn't running; run lampvm start")
+
+    def guest(self, *args, **kwargs):
+        return self.t("exec", self.name, *args, **kwargs)
+
+    def gout(self, *args):
+        return self.tout("exec", self.name, *args)
+
+    def health(self):
+        issues = []
+        record = json.loads(self.marker().read_text())
+        if "panic_reports" in record:
+            source = 'for report in /Library/Logs/DiagnosticReports/*panic*(N) "$HOME"/Library/Logs/DiagnosticReports/*panic*(N); do [[ ! -f "$report" ]] || print -r -- "$report"; done'
+            reports = set(self.gout("/bin/zsh", "-c", source).splitlines())
+            if reports - set(record["panic_reports"]):
+                issues.append("guest has new kernel panic reports; inspect its DiagnosticReports before testing")
+        reporter = subprocess.run([str(self.tart), "exec", self.name, self.ctl, "tree", "Diagnostics Reporter"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=15)
+        if "restarted" in reporter.stdout.lower() and "problem" in reporter.stdout.lower():
+            issues.append("guest displays a restart error; inspect it before testing")
+        return issues
+
+    def control(self, *args, capture=False):
+        if self.ctl is None:
+            self.ctl = self.gout("/bin/zsh", "-c", 'print -r -- "$HOME/.local/bin/vmctl"')
+            if not self.ctl.startswith("/"):
+                raise Error("Guest did not report an absolute vmctl path")
+        return self.gout(self.ctl, *args) if capture else self.guest(self.ctl, *args)
+
+    def application(self, explicit=None):
+        app = explicit or self.app
+        if not app:
+            raise Error("Specify APP or configure app; there is no app-specific default")
+        return app
+
+    def start(self, wait_seconds):
+        self.working()
+        if self.running():
+            print("already running: " + self.name)
+            return
+        deadline = time.monotonic() + wait_seconds
+        # This lock serializes starts by this toolkit. Tart remains the final arbiter
+        # when other VM runners race it for a slot.
+        while True:
+            with lock(self.state / "locks/host-start.lock"):
+                if sum(bool(v.get("Running")) for v in self.machines() if v.get("Source") == "local") < 2:
+                    logdir = self.state / "logs"
+                    logdir.mkdir(parents=True, exist_ok=True)
+                    logfile = logdir / (self.name + "-" + uuid.uuid4().hex + ".log")
+                    with logfile.open("wb") as stream:
+                        proc = subprocess.Popen([str(self.tart), "run", "--no-graphics", "--no-audio", "--no-clipboard", self.name], stdin=subprocess.DEVNULL, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
+                    boot_deadline = time.monotonic() + 120
+                    while time.monotonic() < boot_deadline:
+                        if proc.poll() is not None:
+                            raise Error("Tart exited during boot; inspect " + str(logfile))
+                        try:
+                            ready = subprocess.run([str(self.tart), "exec", self.name, "/usr/bin/pgrep", "-q", "Dock"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+                        except subprocess.TimeoutExpired:
+                            ready = None
+                        if ready and ready.returncode == 0:
+                            self.control("trusted", capture=True)
+                            issues = self.health()
+                            if issues:
+                                raise Error("; ".join(issues) + "; the owned VM remains running for inspection")
+                            print("running: " + self.name)
+                            return
+                        time.sleep(1)
+                    raise Error("Boot timed out; inspect " + str(logfile) + "; the owned VM may still be running")
+            if time.monotonic() >= deadline:
+                raise Error("Both macOS VM slots are busy; use start --wait SECONDS. No other VM was stopped.")
+            print("waiting for a free VM slot", file=sys.stderr)
+            time.sleep(min(5, max(0, deadline - time.monotonic())))
+
+    def stop(self):
+        self.owned()
+        if not self.running():
+            print("already stopped: " + self.name)
+            return
+        subprocess.run([str(self.tart), "exec", self.name, "/usr/bin/sudo", "-n", "/sbin/shutdown", "-h", "now"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(40):
+            if not self.running():
+                print("stopped: " + self.name)
+                return
+            time.sleep(1)
+        self.t("stop", self.name)
+        print("stopped (forced): " + self.name)
+
+    def push(self, source, dest):
+        src = Path(source).expanduser().resolve()
+        if not src.exists():
+            raise Error("Source doesn't exist")
+        script = 'mkdir -p -- "$1" && /usr/bin/tar -xf - -C "$1"'
+        self.pipe_tar(src, script, dest)
+
+    def pipe_tar(self, src, script, *args):
+        tar = subprocess.Popen(["/usr/bin/tar", "-C", str(src.parent), "-cf", "-", "--", src.name], stdout=subprocess.PIPE)
+        try:
+            result = subprocess.run([str(self.tart), "exec", "-i", self.name, "/bin/zsh", "-c", script, "lampvm", *args], stdin=tar.stdout)
+        finally:
+            tar.stdout.close()
+            status = tar.wait()
+        if result.returncode or status:
+            raise Error("File transfer failed")
+
+    def artifact(self, args, video=False):
+        self.need()
+        app = args.app or self.app
+        ident = uuid.uuid4().hex
+        extension = ".mov" if video else ".png"
+        destination = Path(args.file).expanduser() if args.file else self.state / "artifacts" / (self.name + "-" + ident + extension)
+        if destination.exists():
+            raise Error("Output already exists; choose a new filename")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        remote = "/tmp/lampvm-" + ident + extension
+        command = ["/usr/sbin/screencapture", "-x"]
+        if app:
+            # Recording releases the action lock after fixing its capture region,
+            # allowing input commands to run during the recording.
+            with lock(self.state / "locks" / (self.name + ".lock")) if video else contextlib.nullcontext():
+                self.control("activate", app)
+                bounds = self.control("bounds", app, capture=True)
+                if not re.fullmatch(r"-?\d+,-?\d+,\d+,\d+", bounds):
+                    raise Error("Invalid app window bounds: " + bounds)
+                command += ["-R" + bounds]
+        if video:
+            command += ["-v", "-V" + str(args.seconds), "-k"]
+        partial = destination.with_name(destination.name + "." + ident + ".partial")
+        try:
+            self.guest(*command, remote)
+            with partial.open("xb") as stream:
+                self.guest("/bin/cat", remote, stdout=stream)
+            if partial.stat().st_size == 0:
+                raise Error("Capture produced an empty file; check guest recording permission")
+            # Hard-link publishes without overwriting a destination created by a
+            # concurrent call; partial downloads are never exposed as proof.
+            os.link(partial, destination)
+        finally:
+            partial.unlink(missing_ok=True)
+            subprocess.run([str(self.tart), "exec", self.name, "/bin/rm", "-f", remote], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(json.dumps({"file": str(destination.resolve()), "app": app, "vm": self.name, "capture": "video" if video else "screenshot"}))
+
+    def ocr(self, args):
+        app = args.app or self.app
+        remote = "/tmp/lampvm-ocr-" + uuid.uuid4().hex + ".png"
+        command = ["/usr/sbin/screencapture", "-x"]
+        origin, extent = {"x": 0, "y": 0}, None
+        if app:
+            self.control("activate", app)
+            bounds = self.control("bounds", app, capture=True)
+            if not re.fullmatch(r"-?\d+,-?\d+,\d+,\d+", bounds):
+                raise Error("Invalid app window bounds")
+            x, y, width, height = map(int, bounds.split(","))
+            origin, extent = {"x": x, "y": y}, {"width": width, "height": height}
+            command += ["-R" + bounds]
+        try:
+            self.guest(*command, remote)
+            result = json.loads(self.control("ocr", remote, capture=True))
+            result["screenOriginPoints"] = origin
+            if extent:
+                result["pixelsPerPoint"] = {"x": result["width"] / extent["width"], "y": result["height"] / extent["height"]}
+            result["app"] = app
+            print(json.dumps(result))
+        finally:
+            subprocess.run([str(self.tart), "exec", self.name, "/bin/rm", "-f", remote], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def parser():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--name", help="owned VM name (or LAMPVM_NAME)")
+    p.add_argument("--config", help="JSON configuration path (or LAMPVM_CONFIG)")
+    p.add_argument("--state-dir", help="external tools/logs/artifacts directory")
+    sub = p.add_subparsers(dest="command")
+    def add(name, help_text):
+        return sub.add_parser(name, help=help_text)
+    def app_option(q):
+        q.add_argument("--app", help="target application; overrides config")
+    add("help", "show commands")
+    q = add("setup", "download, build and provision an owned VM")
+    q.add_argument("--from", dest="source")
+    q.add_argument("--image")
+    q.add_argument("--no-download", action="store_true")
+    q.add_argument("--wait-slot", type=int, default=0)
+    add("build", "build host and guest helpers into external state")
+    add("doctor", "check host dependencies and guest permissions")
+    q = add("start", "boot an owned VM headlessly")
+    q.add_argument("--wait", type=float, default=0, help="seconds to wait for a VM slot")
+    add("stop", "shut down only the selected owned VM")
+    add("status", "show VM and host lock state")
+    add("apps", "list guest applications and their process names")
+    app_option(add("ocr", "read visible text and image coordinates with offline Vision OCR"))
+    q = add("clone", "make a private stopped VM from a stopped source")
+    q.add_argument("target")
+    q.add_argument("--from", dest="source", help="source VM; defaults to configured clean copy")
+    q = add("destroy", "delete only the selected owned VM")
+    q.add_argument("--yes", action="store_true", required=True)
+    q = add("reset", "replace owned VM with its configured stopped clean copy")
+    q.add_argument("--yes", action="store_true", required=True)
+    q = add("install", "copy a built .app into guest /Applications")
+    q.add_argument("source")
+    q = add("launch", "open an app with optional arguments")
+    q.add_argument("app", nargs="?")
+    q.add_argument("args", nargs=argparse.REMAINDER)
+    q = add("quit", "ask an app to quit")
+    q.add_argument("app", nargs="?")
+    q = add("wipe", "clear only paths and domains configured for this app")
+    q.add_argument("--yes", action="store_true", required=True)
+    for name in ["shot", "record"]:
+        q = add(name, "capture the guest screen or an app window")
+        q.add_argument("file", nargs="?")
+        app_option(q)
+        if name == "record":
+            q.add_argument("--seconds", type=int, default=5)
+    for name in ["tree", "windows", "bounds", "activate"]:
+        q = add(name, "inspect or activate an application")
+        q.add_argument("app", nargs="?")
+        if name == "tree":
+            q.add_argument("--json", action="store_true")
+    for name in ["find", "clickon", "wait", "assert", "setvalue"]:
+        q = add(name, "target an accessible element by label")
+        q.add_argument("operands", nargs="+", help="[APP] TEXT" + (" VALUE" if name == "setvalue" else ""))
+        app_option(q)
+        q.add_argument("--exact", action="store_true")
+        q.add_argument("--role", help="Accessibility role filter, e.g. AXButton")
+        if name == "find":
+            q.add_argument("--json", action="store_true")
+        if name in ["wait", "assert"]:
+            q.add_argument("--absent", action="store_true")
+            q.add_argument("--timeout", type=float, default=10 if name == "wait" else 0)
+        if name in ["clickon", "setvalue"]:
+            q.add_argument("--index", type=int)
+        if name == "clickon":
+            q.add_argument("--right", action="store_true")
+    for name, count in [("click", 2), ("doubleclick", 2), ("rightclick", 2), ("move", 2), ("scroll", 3), ("drag", 4)]:
+        q = add(name, "send real guest mouse events")
+        q.add_argument("values", nargs="+", type=float)
+        app_option(q)
+    q = add("type", "type Unicode into the focused control")
+    q.add_argument("text")
+    app_option(q)
+    q = add("key", "send a supported key with optional modifiers")
+    q.add_argument("key")
+    q.add_argument("modifiers", nargs="?")
+    app_option(q)
+    q = add("exec", "execute a guest program (no shell expansion)")
+    q.add_argument("args", nargs=argparse.REMAINDER)
+    add("sh", "execute a zsh script from standard input")
+    for name in ["push", "pull"]:
+        q = add(name, "transfer a file" + (" or folder into the guest" if name == "push" else " out of the guest"))
+        q.add_argument("source")
+        q.add_argument("destination")
+    return p
+
+
+def main():
+    p = parser()
+    args = p.parse_args()
+    if args.command in [None, "help"]:
+        p.print_help()
+        return
+    vm = VM(args)
+    cmd = args.command
+    if cmd == "build":
+        run([ROOT / "bin/build"], env={**os.environ, "LAMPVM_STATE_DIR": str(vm.state)})
+        return
+    if cmd == "setup":
+        argv = [sys.executable, ROOT / "lib/setup.py", "--state-dir", vm.state, "--name", vm.name]
+        if args.config:
+            argv += ["--config", args.config]
+        if args.source:
+            argv += ["--from", args.source]
+        if args.image:
+            argv += ["--image", args.image]
+        if args.no_download:
+            argv += ["--no-download"]
+        run(argv + ["--wait-slot", str(args.wait_slot)])
+        return
+    if cmd == "doctor":
+        problems = []
+        checks = {"architecture": output(["/usr/bin/uname", "-m"]), "macos": output(["/usr/bin/sw_vers", "-productVersion"]), "state": str(vm.state), "tart": str(vm.tart), "vm": vm.name}
+        if checks["architecture"] != "arm64":
+            problems.append("Apple Silicon is required")
+        if int(checks["macos"].split(".")[0]) < 14:
+            problems.append("macOS 14+ required for tart exec")
+        for tool in ["lockstate", "vmctl"]:
+            if not (vm.state / "bin" / tool).is_file():
+                problems.append("missing built helper: " + tool)
+        if not vm.tart.is_file():
+            problems.append("Tart is missing")
+        elif vm.running():
+            try:
+                checks["accessibility"] = vm.control("trusted", capture=True)
+                problems.extend(vm.health())
+            except Error:
+                problems.append("guest Accessibility isn't granted")
+        checks["problems"] = problems
+        print(json.dumps(checks, indent=2))
+        if problems:
+            raise Error("doctor found problems; see report")
+        return
+    vm.require_tart()
+    # Recording and waits deliberately release the action lock so another call
+    # can cause the change they observe. Captures have unique names on both sides.
+    unlocked = cmd in ["record", "wait", "assert", "status", "tree", "find", "windows", "bounds"]
+    lifecycle_names = [vm.name]
+    if cmd == "clone":
+        lifecycle_names = [valid_name(args.target), valid_name(args.source or vm.clean)]
+    if cmd == "reset":
+        vm.working()
+        lifecycle_names += [valid_name(json.loads(vm.marker().read_text()).get("clean", vm.clean))]
+    with contextlib.nullcontext() if unlocked else locks(vm.state, lifecycle_names):
+        if cmd == "start":
+            if not math.isfinite(args.wait) or not 0 <= args.wait <= 86400:
+                raise Error("--wait must be finite and 0..86400 seconds")
+            vm.start(args.wait)
+            return
+        if cmd == "stop":
+            vm.stop()
+            return
+        if cmd == "status":
+            print(json.dumps([v for v in vm.machines() if v["Name"] in [vm.name, vm.clean]], indent=2))
+            helper = vm.state / "bin/lockstate"
+            if helper.exists():
+                print("host screen: " + output([helper]))
+            return
+        if cmd == "clone":
+            target = valid_name(args.target)
+            source = valid_name(args.source or vm.clean)
+            with contextlib.nullcontext():
+                if vm.exists(target) or vm.marker(target).exists():
+                    raise Error("Target already exists; nothing replaced")
+                src = [v for v in vm.machines() if v["Name"] == source and v.get("Source") == "local"]
+                if not src or src[0].get("Running"):
+                    raise Error("Clone source must be an existing stopped VM")
+                vm.t("clone", source, target)
+                vm.marker(target).parent.mkdir(parents=True, exist_ok=True)
+                record = {"name": target, "clean": source, "source": source}
+                if vm.marker(source).exists():
+                    source_record = json.loads(vm.marker(source).read_text())
+                    if "panic_reports" in source_record:
+                        record["panic_reports"] = source_record["panic_reports"]
+                vm.marker(target).write_text(json.dumps(record) + "\n")
+                print("cloned: " + target)
+            return
+        if cmd == "destroy":
+            vm.working()
+            vm.stop()
+            vm.t("delete", vm.name)
+            vm.marker().unlink()
+            print("deleted: " + vm.name)
+            return
+        if cmd == "reset":
+            vm.working()
+            clean = valid_name(json.loads(vm.marker().read_text()).get("clean", vm.clean))
+            if clean == vm.name:
+                raise Error("Clean copy and working VM must differ")
+            source = [v for v in vm.machines() if v["Name"] == clean and v.get("Source") == "local"]
+            if not source or source[0].get("Running"):
+                raise Error("Clean copy must exist and be stopped")
+            vm.stop()
+            vm.t("delete", vm.name)
+            vm.t("clone", clean, vm.name)
+            print("reset (stopped): " + vm.name)
+            return
+        vm.need()
+        if cmd in ["shot", "record"]:
+            if cmd == "record" and not 1 <= args.seconds <= 300:
+                raise Error("Record duration must be 1..300 seconds")
+            vm.artifact(args, cmd == "record")
+        elif cmd == "ocr":
+            vm.ocr(args)
+        elif cmd == "apps":
+            vm.control("apps")
+        elif cmd == "install":
+            src = Path(args.source).expanduser().resolve()
+            if not src.is_dir() or src.suffix != ".app" or not (src / "Contents/Info.plist").is_file():
+                raise Error("Install expects a built .app bundle with Contents/Info.plist")
+            vm.control("quit", src.stem)
+            script = '''set -eu
+staging=$(/usr/bin/mktemp -d /tmp/lampvm-install.XXXXXXXX)
+mkdir -p "$staging/new" "$staging/old"
+/usr/bin/tar -xf - -C "$staging/new"
+[[ ! -e "/Applications/$1" ]] || mv -- "/Applications/$1" "$staging/old/"
+mv -- "$staging/new/$1" /Applications/
+/usr/bin/xattr -cr "/Applications/$1"
+'''
+            vm.pipe_tar(src, script, src.name)
+            print("installed: " + src.name)
+        elif cmd == "launch":
+            app = vm.application(args.app)
+            path = "/Applications/" + app + ".app"
+            exists = subprocess.run([str(vm.tart), "exec", vm.name, "/bin/test", "-d", path]).returncode == 0
+            argv = ["/usr/bin/open", "-a", path if exists else app]
+            launch_args = args.args[1:] if args.args[:1] == ["--"] else args.args
+            if launch_args:
+                argv += ["--args", *launch_args]
+            vm.guest(*argv)
+        elif cmd == "quit":
+            vm.control("quit", vm.application(args.app))
+        elif cmd == "wipe":
+            wipe = vm.config.get("wipe", {})
+            domains, paths = wipe.get("preference_domains", []), wipe.get("paths", [])
+            if not domains and not paths:
+                raise Error("No wipe paths/domains configured; nothing removed")
+            if any(not re.fullmatch(r"[A-Za-z0-9._-]+", x) for x in domains):
+                raise Error("Invalid preference domain")
+            if any(not x.startswith(("Library/Application Support/", "Applications/")) or ".." in Path(x).parts for x in paths):
+                raise Error("Wipe paths must be relative app-data paths under Library/Application Support or Applications")
+            vm.control("quit", vm.application())
+            for domain in domains:
+                subprocess.run([str(vm.tart), "exec", vm.name, "/usr/bin/defaults", "delete", domain], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            script = 'set -eu; staging=$(mktemp -d /tmp/lampvm-wipe.XXXXXXXX); cd "$HOME"; for p in "$@"; do [[ ! -e "$p" ]] || mv -- "$p" "$staging/${RANDOM}-${p:t}"; done'
+            vm.guest("/bin/zsh", "-c", script, "lampvm", *paths)
+            print("wiped configured app preferences and data (not Keychain)")
+        elif cmd in ["tree", "windows", "bounds", "activate"]:
+            argv = [cmd, vm.application(args.app)]
+            if getattr(args, "json", False):
+                argv.append("--json")
+            vm.control(*argv)
+        elif cmd in ["find", "clickon", "wait", "assert", "setvalue"]:
+            count = 2 if cmd == "setvalue" else 1
+            if len(args.operands) == count:
+                app, operands = vm.application(), args.operands
+            elif len(args.operands) == count + 1:
+                app, operands = args.operands[0], args.operands[1:]
+            else:
+                raise Error("Expected [APP] TEXT" + (" VALUE" if count == 2 else ""))
+            argv = [cmd, app, *operands]
+            for flag in ["exact", "json", "right", "absent"]:
+                if getattr(args, flag, False):
+                    argv.append("--" + flag)
+            if getattr(args, "index", None) is not None:
+                argv += ["--index", str(args.index)]
+            if args.role:
+                argv += ["--role", args.role]
+            if hasattr(args, "timeout"):
+                if not math.isfinite(args.timeout) or not 0 <= args.timeout <= 3600:
+                    raise Error("Timeout must be 0..3600 seconds")
+                argv += ["--timeout", str(args.timeout)]
+            vm.control(*argv)
+        elif cmd in ["click", "doubleclick", "rightclick", "move", "scroll", "drag", "type", "key"]:
+            if hasattr(args, "values"):
+                allowed = {"click": (2,), "doubleclick": (2,), "rightclick": (2,), "move": (2,), "scroll": (3, 4), "drag": (4, 5)}[cmd]
+                if len(args.values) not in allowed or not all(math.isfinite(v) and abs(v) <= 1_000_000 for v in args.values):
+                    raise Error("Wrong number of coordinates or numeric value outside +/-1000000")
+            if vm.app:
+                vm.control("activate", vm.app)
+            values = [args.text] if cmd == "type" else ([args.key] + ([args.modifiers] if args.modifiers else [])) if cmd == "key" else [str(x) for x in args.values]
+            vm.control(cmd, *values)
+        elif cmd == "exec":
+            if not args.args:
+                raise Error("exec needs a command")
+            vm.guest(*args.args)
+        elif cmd == "sh":
+            vm.t("exec", "-i", vm.name, "/bin/zsh", "-s")
+        elif cmd == "push":
+            vm.push(args.source, args.destination)
+            print("copied into guest: " + args.destination)
+        elif cmd == "pull":
+            dest = Path(args.destination).expanduser()
+            if dest.exists():
+                raise Error("Destination exists; choose a new filename")
+            partial = dest.with_name(dest.name + "." + uuid.uuid4().hex + ".partial")
+            try:
+                with partial.open("xb") as stream:
+                    vm.guest("/bin/cat", args.source, stdout=stream)
+                os.link(partial, dest)
+            finally:
+                partial.unlink(missing_ok=True)
+            print(str(dest))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (Error, OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        print("lampvm: " + str(error), file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("lampvm: interrupted; the owned VM may still be running", file=sys.stderr)
+        sys.exit(130)

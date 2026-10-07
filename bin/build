@@ -1,0 +1,17 @@
+#!/bin/zsh
+# Build outside the checkout. The host helper inherits the installed SDK's target.
+set -euo pipefail
+ROOT="${0:A:h:h}"
+STATE="${LAMPVM_STATE_DIR:-$HOME/Library/Application Support/lampvm}"
+if [[ "$(uname -s)" != Darwin || "$(uname -m)" != arm64 ]]; then
+  print -u2 'lampvm requires an Apple Silicon Mac'; exit 1
+fi
+if ! xcrun --find swiftc >/dev/null 2>&1; then
+  print -u2 'Install Apple Command Line Tools with xcode-select --install, complete its installer, then rerun setup.'; exit 1
+fi
+mkdir -p "$STATE/bin"
+# An old deployment-target environment variable must not make lockstate require a newer OS.
+HOST_VERSION="$(sw_vers -productVersion)"
+env -u MACOSX_DEPLOYMENT_TARGET xcrun swiftc -O -target "arm64-apple-macos$HOST_VERSION" "$ROOT/src/lockstate.swift" -o "$STATE/bin/lockstate"
+env -u MACOSX_DEPLOYMENT_TARGET xcrun swiftc -O -target arm64-apple-macos14 "$ROOT/src/vmctl.swift" -o "$STATE/bin/vmctl"
+print -r -- "built $STATE/bin/{lockstate,vmctl}"

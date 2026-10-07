@@ -1,0 +1,12 @@
+{
+  "app": "Lamp",
+  "wipe": {
+    "preference_domains": ["dev.lamp.host", "dev.forge.host"],
+    "paths": [
+      "Library/Application Support/Lamp",
+      "Library/Application Support/Forge",
+      "Applications/Lamp Apps",
+      "Applications/Forge Apps"
+    ]
+  }
+}
