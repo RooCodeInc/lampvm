@@ -18,6 +18,8 @@ import time
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "lib"))
+from bootstrap import complete_desktop
 STATE = Path(os.environ.get("LAMPVM_STATE_DIR", str(Path.home() / "Library/Application Support/lampvm"))).expanduser()
 VERSION = "2.32.1"
 TART_SHA256 = "8554ab4f7fc12afe52f9b7e3093a935673cbac737a83973d2db7a0683c814529"
@@ -262,7 +264,6 @@ os_build=$(/usr/bin/sw_vers -buildVersion)
 /usr/bin/sudo -n /usr/bin/defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticDownload -bool false
 /usr/bin/sudo -n /usr/bin/defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticCheckEnabled -bool false
 /usr/bin/sudo -n /usr/bin/defaults write /Library/Preferences/com.apple.commerce AutoUpdate -bool false
-/usr/bin/pkill -x 'Setup Assistant' || true
 # Tart base images use public admin/admin auto-login and passwordless sudo already.
 # Preserve their credentials rather than copying any host user or keychain.
 if [[ "$os_version" == 27* ]]; then
@@ -377,13 +378,13 @@ def main():
             check_guest_health(vm, ctl, known_panics)
             vm.script(PROVISION)
             vm.guest(ctl, "display", *config["display"].split("x"))
-            # Some images leave post-update Setup Assistant panes; stored completion keys
-            # and terminating the disposable assistant avoid signing into any account.
+            # Reboot to apply guest grants, then complete actual assistant pages.
             vm.stop()
             vm.start(args.wait_slot)
             trusted = vm.text(ctl, "trusted")
             if "true" not in trusted.lower() and "yes" not in trusted.lower():
                 raise RuntimeError("Guest Accessibility validation failed: " + trusted)
+            complete_desktop(tart, name, ctl)
             check_guest_health(vm, ctl, known_panics)
             vm.guest("/usr/bin/open", "-a", "TextEdit")
             time.sleep(3)

@@ -87,6 +87,16 @@ def main():
             raise RuntimeError("Label click didn't land")
         call("assert", APP, "Clicks: 1", "--exact")
         shot("02-activated-click")
+        hitx, hity = point("Click Me")
+        hit = result_json(call("hit", hitx, hity))
+        if hit.get("role") != "AXButton" or "Click Me" not in hit.get("label", ""):
+            raise RuntimeError("Hit diagnostics missed the button")
+        shot("02-hit-diagnostics")
+        pressed = result_json(call("press", APP, "Click Me", "--exact"))
+        if not pressed.get("performed") or pressed.get("method") != "AXPress":
+            raise RuntimeError("Accessibility press didn't perform")
+        call("assert", APP, "Clicks: 2", "--exact")
+        shot("02-accessibility-press")
 
         call("clickon", APP, "Type here", "--exact")
         call("type", "Agent input 🧪")

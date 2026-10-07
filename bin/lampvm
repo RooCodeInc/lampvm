@@ -14,6 +14,8 @@ import time
 import uuid
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "lib"))
+from bootstrap import complete_desktop
 
 
 class Error(Exception):
@@ -146,6 +148,9 @@ class VM:
         reporter = subprocess.run([str(self.tart), "exec", self.name, self.ctl, "tree", "Diagnostics Reporter"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=15)
         if "restarted" in reporter.stdout.lower() and "problem" in reporter.stdout.lower():
             issues.append("guest displays a restart error; inspect it before testing")
+        assistant = subprocess.run([str(self.tart), "exec", self.name, self.ctl, "windows", "com.apple.SetupAssistant"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=15)
+        if assistant.returncode == 0 and json.loads(assistant.stdout):
+            issues.append("Setup Assistant is still open; complete setup before testing")
         return issues
 
     def control(self, *args, capture=False):
@@ -187,6 +192,7 @@ class VM:
                             ready = None
                         if ready and ready.returncode == 0:
                             self.control("trusted", capture=True)
+                            complete_desktop(self.tart, self.name, self.ctl)
                             issues = self.health()
                             if issues:
                                 raise Error("; ".join(issues) + "; the owned VM remains running for inspection")
@@ -343,7 +349,7 @@ def parser():
         q.add_argument("app", nargs="?")
         if name == "tree":
             q.add_argument("--json", action="store_true")
-    for name in ["find", "clickon", "wait", "assert", "setvalue"]:
+    for name in ["find", "clickon", "press", "wait", "assert", "setvalue"]:
         q = add(name, "target an accessible element by label")
         q.add_argument("operands", nargs="+", help="[APP] TEXT" + (" VALUE" if name == "setvalue" else ""))
         app_option(q)
@@ -354,12 +360,12 @@ def parser():
         if name in ["wait", "assert"]:
             q.add_argument("--absent", action="store_true")
             q.add_argument("--timeout", type=float, default=10 if name == "wait" else 0)
-        if name in ["clickon", "setvalue"]:
+        if name in ["clickon", "press", "setvalue"]:
             q.add_argument("--index", type=int)
         if name == "clickon":
             q.add_argument("--right", action="store_true")
-    for name, count in [("click", 2), ("doubleclick", 2), ("rightclick", 2), ("move", 2), ("scroll", 3), ("drag", 4)]:
-        q = add(name, "send real guest mouse events")
+    for name, count in [("click", 2), ("doubleclick", 2), ("rightclick", 2), ("move", 2), ("hit", 2), ("scroll", 3), ("drag", 4)]:
+        q = add(name, "inspect the accessible element under a point" if name == "hit" else "send real guest mouse events")
         q.add_argument("values", nargs="+", type=float)
         app_option(q)
     q = add("type", "type Unicode into the focused control")
@@ -544,7 +550,7 @@ mv -- "$staging/new/$1" /Applications/
             if getattr(args, "json", False):
                 argv.append("--json")
             vm.control(*argv)
-        elif cmd in ["find", "clickon", "wait", "assert", "setvalue"]:
+        elif cmd in ["find", "clickon", "press", "wait", "assert", "setvalue"]:
             count = 2 if cmd == "setvalue" else 1
             if len(args.operands) == count:
                 app, operands = vm.application(), args.operands
@@ -565,12 +571,12 @@ mv -- "$staging/new/$1" /Applications/
                     raise Error("Timeout must be 0..3600 seconds")
                 argv += ["--timeout", str(args.timeout)]
             vm.control(*argv)
-        elif cmd in ["click", "doubleclick", "rightclick", "move", "scroll", "drag", "type", "key"]:
+        elif cmd in ["click", "doubleclick", "rightclick", "move", "hit", "scroll", "drag", "type", "key"]:
             if hasattr(args, "values"):
-                allowed = {"click": (2,), "doubleclick": (2,), "rightclick": (2,), "move": (2,), "scroll": (3, 4), "drag": (4, 5)}[cmd]
+                allowed = {"click": (2,), "doubleclick": (2,), "rightclick": (2,), "move": (2,), "hit": (2,), "scroll": (3, 4), "drag": (4, 5)}[cmd]
                 if len(args.values) not in allowed or not all(math.isfinite(v) and abs(v) <= 1_000_000 for v in args.values):
                     raise Error("Wrong number of coordinates or numeric value outside +/-1000000")
-            if vm.app:
+            if vm.app and cmd != "hit":
                 vm.control("activate", vm.app)
             values = [args.text] if cmd == "type" else ([args.key] + ([args.modifiers] if args.modifiers else [])) if cmd == "key" else [str(x) for x in args.values]
             vm.control(cmd, *values)
@@ -600,7 +606,7 @@ mv -- "$staging/new/$1" /Applications/
 if __name__ == "__main__":
     try:
         main()
-    except (Error, OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+    except (Error, RuntimeError, OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
         print("lampvm: " + str(error), file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:

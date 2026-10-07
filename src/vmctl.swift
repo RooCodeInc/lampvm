@@ -24,8 +24,8 @@ func number(_ index: Int) -> Double {
 // Validate the remaining tokens before touching the desktop, including numeric arity.
 let optionArguments: [String] = {
     let command = args.first ?? ""
-    let required = ["click":3,"doubleclick":3,"rightclick":3,"move":3,"scroll":4,"drag":5,
-                    "type":2,"key":2,"activate":2,"quit":2,"tree":2,"find":3,"clickon":3,
+    let required = ["click":3,"doubleclick":3,"rightclick":3,"move":3,"hit":3,"scroll":4,"drag":5,
+                    "type":2,"key":2,"activate":2,"quit":2,"tree":2,"find":3,"clickon":3,"press":3,
                     "setvalue":4,"wait":3,"assert":3,"bounds":2,"windows":2,"ocr":2]
     var start = required[command] ?? 1
     if let count = required[command], args.count < count { fail("not enough arguments for \(command); run vmctl without arguments for usage") }
@@ -36,11 +36,11 @@ let optionArguments: [String] = {
     let valueFlags: [String:Set<String>] = [
         "click":["--app"],"doubleclick":["--app"],"rightclick":["--app"],"move":["--app"],
         "scroll":["--app"],"drag":["--app"],"type":["--app"],"key":["--app"],
-        "find":["--role"],"clickon":["--role","--index"],"setvalue":["--role","--index"],
+        "find":["--role"],"clickon":["--role","--index"],"press":["--role","--index"],"setvalue":["--role","--index"],
         "wait":["--role","--timeout"],"assert":["--role","--timeout"]]
     let boolFlags: [String:Set<String>] = [
         "tree":["--json"],"find":["--json","--exact"],"clickon":["--exact","--right"],
-        "setvalue":["--exact"],"wait":["--exact","--absent"],"assert":["--exact","--absent"],
+        "setvalue":["--exact"],"press":["--exact"],"wait":["--exact","--absent"],"assert":["--exact","--absent"],
         "bounds":["--json"],"trusted":["--prompt"]]
     let options = Array(args.dropFirst(start)); var index = 0; var seen: Set<String> = []
     while index < options.count {
@@ -150,17 +150,22 @@ struct Found {
         var object: [String:Any] = ["role":role,"label":label,"path":path]
         if let rect { object["bounds"] = rectJSON(rect) }
         if let enabled: Bool = attribute(element,kAXEnabledAttribute) { object["enabled"] = enabled }
+        if let value: NSNumber = attribute(element,kAXValueAttribute) { object["value"] = value }
+        else if let value: String = attribute(element,kAXValueAttribute) { object["value"] = value }
         return object
     }
 }
-func walk(_ element: AXUIElement, depth: Int = 0, path: String = "0", into found: inout [Found]) {
-    guard depth < 40, found.count < 20_000 else { return }
+func describe(_ element: AXUIElement, path: String) -> Found {
     let role: String = attribute(element,kAXRoleAttribute) ?? "?"
     var parts: [String] = []
     for name in [kAXTitleAttribute,kAXDescriptionAttribute,kAXValueAttribute,kAXPlaceholderValueAttribute,kAXIdentifierAttribute] {
         if let text: String = attribute(element,name), !text.isEmpty, !parts.contains(text) { parts.append(text) }
     }
-    found.append(Found(element:element,role:role,label:parts.joined(separator:" | "),rect:frame(element),path:path))
+    return Found(element:element,role:role,label:parts.joined(separator:" | "),rect:frame(element),path:path)
+}
+func walk(_ element: AXUIElement, depth: Int = 0, path: String = "0", into found: inout [Found]) {
+    guard depth < 40, found.count < 20_000 else { return }
+    found.append(describe(element,path:path))
     let children: [AXUIElement] = attribute(element,kAXChildrenAttribute) ?? []
     for (index,child) in children.enumerated() { walk(child,depth:depth + 1,path:path + ".\(index)",into:&found) }
 }
@@ -199,7 +204,9 @@ func show(_ items: [Found]) {
         print("\(item.role)\t\(Int(f.midX)),\(Int(f.midY))\t\(Int(f.width))x\(Int(f.height))\t\(item.label.replacingOccurrences(of:"\n",with:" "))")
     }
 }
+// Raising an already-frontmost app can dismiss its transient menu or popover.
 func activate(_ application: NSRunningApplication) {
+    if NSWorkspace.shared.frontmostApplication?.processIdentifier == application.processIdentifier { return }
     guard application.activate(options:[.activateAllWindows]) else { fail("could not activate app") }
     let ax = AXUIElementCreateApplication(application.processIdentifier)
     if let window: AXUIElement = attribute(ax,kAXFocusedWindowAttribute) { _ = AXUIElementPerformAction(window,kAXRaiseAction as CFString) }
@@ -218,6 +225,22 @@ func hit(_ point: CGPoint) -> AXUIElement? {
 func pid(_ element: AXUIElement?) -> pid_t? {
     guard let element else { return nil }; var result: pid_t = 0
     return AXUIElementGetPid(element,&result) == .success ? result : nil
+}
+func hitDiagnostics(_ element: AXUIElement?) -> [String:Any] {
+    guard let element else { return ["hit":false] }
+    var result = describe(element,path:"hit").object
+    result["hit"] = true; result["pid"] = pid(element) ?? -1
+    var current: AXUIElement? = attribute(element,kAXParentAttribute), seen: [AXUIElement] = [element]
+    var ancestors: [[String:Any]] = []
+    while let parent = current, ancestors.count < 40 {
+        if seen.contains(where: { CFEqual($0,parent) }) { break }
+        seen.append(parent)
+        var summary = describe(parent,path:"parent.\(ancestors.count)").object
+        summary["pid"] = pid(parent) ?? -1; ancestors.append(summary)
+        current = attribute(parent,kAXParentAttribute)
+    }
+    result["ancestors"] = ancestors
+    return result
 }
 func descends(_ child: AXUIElement, from parent: AXUIElement) -> Bool {
     var current: AXUIElement? = child
@@ -256,6 +279,10 @@ func recognize(_ path: String) {
 }
 
 switch args.first {
+case "hit":
+    require(3,"hit X Y"); let point = CGPoint(x:number(1),y:number(2)); trusted()
+    var result = hitDiagnostics(hit(point)); result["x"] = point.x; result["y"] = point.y; json(result)
+    if result["hit"] as? Bool != true { exit(1) }
 case "click","doubleclick","rightclick","move":
     require(3,"\(args[0]) X Y [--app APP]"); let point = CGPoint(x:number(1),y:number(2)); trusted(); activateConfigured()
     if args[0] == "move" { mouse(.mouseMoved,point) } else { click(point,count:args[0] == "doubleclick" ? 2 : 1,right:args[0] == "rightclick") }
@@ -284,9 +311,9 @@ case "quit":
     json(["running":!terminated,"requested":requested,"terminated":terminated,"pid":application.processIdentifier])
     if !terminated { fail("app did not quit; inspect its window for an unsaved-changes prompt or refusal") }
 case "tree": require(2,"tree APP [--json]"); trusted(); show(elements(app(args[1])))
-case "find","clickon","setvalue":
+case "find","clickon","press","setvalue":
     require(args[0] == "setvalue" ? 4 : 3,"\(args[0]) APP TEXT [VALUE] [--exact] [--index N] [--json]"); trusted(); let application = app(args[1])
-    if args[0] == "clickon" || args[0] == "setvalue" { activate(application) }
+    if ["clickon","press","setvalue"].contains(args[0]) { activate(application) }
     let found = matches(elements(application),args[2])
     if args[0] == "find" { show(found); exit(found.isEmpty ? 1 : 0) }
     let item = target(found)
@@ -298,10 +325,18 @@ case "find","clickon","setvalue":
         guard result == .success else { fail("setting value failed: \(result.rawValue)") }
         let actual: String = attribute(item.element,kAXValueAttribute) ?? ""
         json(["set":true,"verified":actual == args[3],"role":item.role]); if actual != args[3] { exit(1) }
+    } else if args[0] == "press" {
+        // An explicit semantic action, distinct from posting a real mouse click.
+        let result = AXUIElementPerformAction(item.element,kAXPressAction as CFString)
+        guard result == .success else {
+            json(["performed":false,"method":"AXPress","errorCode":result.rawValue,"target":item.object])
+            fail("Accessibility press failed: \(result.rawValue)")
+        }
+        json(["performed":true,"method":"AXPress","target":item.object])
     } else {
         let f = item.rect!, point = CGPoint(x:f.midX,y:f.midY), before = hit(point)
         let landed = before.map { pid($0) == application.processIdentifier && descends($0,from:item.element) } ?? false
-        guard landed else { json(["landed":false,"eventPosted":false,"reason":"hit-test did not identify the target or its descendant","target":item.object,"hitPID":pid(before) ?? -1]); exit(1) }
+        guard landed else { json(["landed":false,"eventPosted":false,"reason":"hit-test did not identify the target or its descendant","target":item.object,"hitPID":pid(before) ?? -1,"hit":hitDiagnostics(before)]); exit(1) }
         click(point,right:has("--right")); usleep(100_000)
         json(["landed":true,"eventPosted":true,"verification":"pre-click Accessibility hit-test matched target or descendant; semantic result requires a subsequent assertion","target":item.object,"postClickHitPID":pid(hit(point)) ?? -1])
     }
@@ -354,5 +389,5 @@ case "trusted":
     let value = has("--prompt") ? AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String:true] as CFDictionary) : AXIsProcessTrusted()
     print(value ? "yes" : "no"); exit(value ? 0 : 1)
 default:
-    fail("usage: vmctl click|doubleclick|rightclick X Y | move X Y | scroll X Y DY [DX] | drag X1 Y1 X2 Y2 [SECONDS] | type TEXT | key NAME [mods] | activate|quit APP | tree APP [--json] | find|clickon APP TEXT | wait|assert APP TEXT [--absent] [--timeout SEC] | setvalue APP TEXT VALUE | bounds|windows APP | apps | ocr IMAGE_PATH | trusted [--prompt] | display [WIDTH HEIGHT]")
+    fail("usage: vmctl click|doubleclick|rightclick X Y | move X Y | hit X Y | scroll X Y DY [DX] | drag X1 Y1 X2 Y2 [SECONDS] | type TEXT | key NAME [mods] | activate|quit APP | tree APP [--json] | find|clickon|press APP TEXT | wait|assert APP TEXT [--absent] [--timeout SEC] | setvalue APP TEXT VALUE | bounds|windows APP | apps | ocr IMAGE_PATH | trusted [--prompt] | display [WIDTH HEIGHT]")
 }

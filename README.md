@@ -19,7 +19,9 @@ bin/lampvm exec /usr/bin/sw_vers
 
 Setup downloads pinned Tart 2.32.1, preserves its signed application bundle, verifies its checksum and signature, builds the guest controller and a host lock-state helper, downloads a public macOS base image pinned by OCI digest and prepares a working VM plus a stopped clean snapshot. It never downloads or includes another user's VM. First setup can take a long time because the image is large. Setup options include `--image OCI_REFERENCE`, `--no-download` to use an existing Tart, and `--wait-slot SECONDS` to wait without stopping anyone else. Use `python3 lib/setup.py --help` to list preparation options. `--from EXISTING_STOPPED_VM` uses a local clean image instead of downloading one; only use a source you know contains no private data.
 
-The public base image is configured for automation, with user/password `admin`/`admin`, automatic login, passwordless sudo and SIP disabled. It includes Tart's guest agent. This is an isolated test desktop, not a place for real credentials or personal work. Setup prepares guest automation access. macOS can still present first-boot/update and screen capture consent prompts; read `doctor` output and a screenshot if a capture or Accessibility request fails. Confirm the app works before treating setup success as a test result.
+Setup and first start finish the pinned image's known English post-update pages through observable controls: defer updates, skip Apple Account sign-in and decline FileVault. The final welcome button uses an explicit Accessibility press because macOS exposes its mouse hit only as the application. Completion requires the assistant to disappear; unfamiliar pages stop with inspection instructions.
+
+The public base image is configured for automation, with user/password `admin`/`admin`, automatic login, passwordless sudo and SIP disabled. It includes Tart's guest agent. This is an isolated test desktop, not a place for real credentials or personal work. Setup prepares guest automation access. macOS can still present unfamiliar first-boot/update or screen capture consent prompts; read `doctor` output and a screenshot if a capture or Accessibility request fails. Confirm the app works before treating setup success as a test result.
 
 Runtime files live under `~/Library/Application Support/lampvm`; VMs and downloaded image cache live under Tart's own `~/.tart`. Compiled tools, logs, screenshots, recordings and VM disks stay outside git. `bin/lampvm build` rebuilds the tools; the lock-state helper targets the host's macOS version rather than one developer's machine.
 
@@ -71,7 +73,7 @@ Global selection: `--name NAME`, `--config FILE`, `--state-dir DIRECTORY`. Envir
 |---|---|
 | `setup` | Downloads dependencies, builds tools and prepares the guest and clean image. `--from VM` uses a stopped local source. |
 | `build` | Builds the host lock-state and guest input/inspection helpers into external state. |
-| `doctor` | Checks host version/architecture, installed helpers/Tart and Accessibility if the selected guest is running. It does not prove video consent or every interaction. |
+| `doctor` | Checks host dependencies, Accessibility and reported guest health, including unfinished Setup Assistant. It does not prove video consent or every interaction. |
 | `start [--wait SECONDS]` | Starts the selected VM without a host window, audio or shared clipboard, and waits for its desktop. Waits for a free slot if requested. |
 | `stop` | Shuts down the selected VM, then forces it off if graceful shutdown times out. |
 | `status` | Reports VM state/configuration and host lock state. |
@@ -89,6 +91,8 @@ Global selection: `--name NAME`, `--config FILE`, `--state-dir DIRECTORY`. Envir
 | `find [APP] TEXT [--json] [--exact] [--role ROLE]` | Finds labelled Accessibility elements; role restricts matches (for example `AXButton`). |
 | `windows [APP]` / `bounds [APP]` | Lists app windows / reports an app window's screen rectangle. |
 | `clickon [APP] TEXT` | Activates the app, finds an element and posts a real click, then reports the target/hit result as JSON. Use `--exact`, `--role ROLE`, zero-based `--index N`, or `--right`. |
+| `press [APP] TEXT` | Performs the element's Accessibility press action, with `--exact`, `--role` and `--index`. This is a semantic action; verify the resulting app state. |
+| `hit X Y` | Inspects the Accessibility element under a point and its parents, including role, label, bounds and process ID. It posts no input. |
 | `click X Y` / `doubleclick X Y` | Posts left clicks at screen coordinates. |
 | `rightclick X Y` / `move X Y` | Posts a right click / moves the pointer. |
 | `scroll X Y DY [DX]` | Positions the pointer and posts wheel scrolling; positive DY scrolls up. |

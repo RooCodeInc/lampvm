@@ -1,0 +1,491 @@
+{
+  "apple-options": {
+    "action": {
+      "label": "Sign in Later in Settings",
+      "role": "AXMenuItem"
+    },
+    "elements": [
+      {
+        "role": "AXWindow",
+        "label": "Window | iCloudLogin",
+        "bounds": {
+          "height": 600,
+          "width": 800,
+          "x": 320,
+          "y": 150
+        },
+        "path": "0.0"
+      },
+      {
+        "role": "AXStaticText",
+        "label": "Sign In to Your Apple Account",
+        "bounds": {
+          "height": 22.5,
+          "width": 452,
+          "x": 494,
+          "y": 333
+        },
+        "enabled": true,
+        "path": "0.0.0.0"
+      },
+      {
+        "role": "AXStaticText",
+        "label": "Sign in to use iCloud, the App Store, and other Apple services.",
+        "bounds": {
+          "height": 43,
+          "width": 452,
+          "x": 494,
+          "y": 353.5
+        },
+        "enabled": true,
+        "path": "0.0.0.1"
+      },
+      {
+        "role": "AXButton",
+        "label": "Continue | Next Button",
+        "bounds": {
+          "height": 38,
+          "width": 130,
+          "x": 971,
+          "y": 693
+        },
+        "enabled": false,
+        "path": "0.0.2"
+      },
+      {
+        "role": "AXButton",
+        "label": "Other Sign-In Options  | Alternate Button",
+        "bounds": {
+          "height": 38,
+          "width": 181.5,
+          "x": 339,
+          "y": 693
+        },
+        "enabled": false,
+        "path": "0.0.3"
+      },
+      {
+        "role": "AXMenuItem",
+        "label": "Sign in Later in Settings | userDeclinediCloud",
+        "bounds": {
+          "height": 24,
+          "width": 197,
+          "x": 340,
+          "y": 754
+        },
+        "enabled": true,
+        "path": "0.0.3.0.1"
+      }
+    ]
+  },
+  "apple-skip": {
+    "action": {
+      "label": "Skip",
+      "role": "AXButton"
+    },
+    "elements": [
+      {
+        "role": "AXWindow",
+        "label": "Window | iCloudLogin",
+        "bounds": {
+          "height": 600,
+          "width": 800,
+          "x": 320,
+          "y": 150
+        },
+        "path": "0.0"
+      },
+      {
+        "role": "AXStaticText",
+        "label": "Sign In to Your Apple Account",
+        "bounds": {
+          "height": 22.5,
+          "width": 452,
+          "x": 494,
+          "y": 333
+        },
+        "enabled": true,
+        "path": "0.0.0.0"
+      },
+      {
+        "role": "AXStaticText",
+        "label": "Sign in to use iCloud, the App Store, and other Apple services.",
+        "bounds": {
+          "height": 43,
+          "width": 452,
+          "x": 494,
+          "y": 353.5
+        },
+        "enabled": true,
+        "path": "0.0.0.1"
+      },
+      {
+        "role": "AXStaticText",
+        "label": "Email or Phone Number",
+        "bounds": {
+          "height": 24,
+          "width": 452,
+          "x": 494,
+          "y": 420.5
+        },
+        "enabled": true,
+        "path": "0.0.0.2"
+      },
+      {
+        "role": "AXButton",
+        "label": "Continue | Next Button",
+        "bounds": {
+          "height": 38,
+          "width": 130,
+          "x": 971,
+          "y": 693
+        },
+        "enabled": true,
+        "path": "0.0.2"
+      },
+      {
+        "role": "AXButton",
+        "label": "Other Sign-In Options  | Alternate Button",
+        "bounds": {
+          "height": 38,
+          "width": 181.5,
+          "x": 339,
+          "y": 693
+        },
+        "enabled": true,
+        "path": "0.0.3"
+      },
+      {
+        "role": "AXSheet",
+        "label": "alert | _NS:87",
+        "bounds": {
+          "height": 266,
+          "width": 260,
+          "x": 590,
+          "y": 317
+        },
+        "path": "0.0.5"
+      },
+      {
+        "role": "AXStaticText",
+        "label": "Are you sure you want to skip signing in with an Apple Account? | _NS:74",
+        "bounds": {
+          "height": 50,
+          "width": 218,
+          "x": 611,
+          "y": 416
+        },
+        "enabled": true,
+        "path": "0.0.5.1"
+      },
+      {
+        "role": "AXStaticText",
+        "label": "An Apple Account is used to automatically set up the App Store, iCloud, and other Apple services. | _NS:58",
+        "bounds": {
+          "height": 50,
+          "width": 218,
+          "x": 611,
+          "y": 474
+        },
+        "enabled": true,
+        "path": "0.0.5.2"
+      },
+      {
+        "role": "AXButton",
+        "label": "Don\u2019t Skip | action-button-2",
+        "bounds": {
+          "height": 30,
+          "width": 112,
+          "x": 605,
+          "y": 538
+        },
+        "enabled": true,
+        "path": "0.0.5.3"
+      },
+      {
+        "role": "AXButton",
+        "label": "Skip | action-button-1",
+        "bounds": {
+          "height": 30,
+          "width": 112,
+          "x": 723,
+          "y": 538
+        },
+        "enabled": true,
+        "path": "0.0.5.4"
+      }
+    ]
+  },
+  "filevault": {
+    "action": {
+      "label": "Not Now",
+      "role": "AXButton"
+    },
+    "elements": [
+      {
+        "role": "AXWindow",
+        "label": "Window | iCloudEnableFDEUpsell",
+        "bounds": {
+          "height": 600,
+          "width": 800,
+          "x": 320,
+          "y": 150
+        },
+        "path": "0.0"
+      },
+      {
+        "role": "AXStaticText",
+        "label": "Your Mac is Ready for FileVault",
+        "bounds": {
+          "height": 22.5,
+          "width": 452,
+          "x": 494,
+          "y": 335
+        },
+        "enabled": true,
+        "path": "0.0.0.0"
+      },
+      {
+        "role": "AXStaticText",
+        "label": "FileVault keeps your Mac safe by encrypting your data and protecting it with the password you use to log in. If you forget your password, you can use your Recovery Key to reset it.",
+        "bounds": {
+          "height": 85,
+          "width": 452,
+          "x": 494,
+          "y": 355.5
+        },
+        "enabled": true,
+        "path": "0.0.0.1"
+      },
+      {
+        "role": "AXButton",
+        "label": "Turn On | Next Button",
+        "bounds": {
+          "height": 38,
+          "width": 130,
+          "x": 971,
+          "y": 693
+        },
+        "enabled": true,
+        "path": "0.0.1"
+      },
+      {
+        "role": "AXButton",
+        "label": "Not Now | Cancel Button",
+        "bounds": {
+          "height": 38,
+          "width": 130,
+          "x": 827,
+          "y": 693
+        },
+        "enabled": true,
+        "path": "0.0.2"
+      }
+    ]
+  },
+  "filevault-decline": {
+    "action": {
+      "label": "Continue",
+      "role": "AXButton"
+    },
+    "elements": [
+      {
+        "role": "AXWindow",
+        "label": "Window | iCloudEnableFDEUpsell",
+        "bounds": {
+          "height": 600,
+          "width": 800,
+          "x": 320,
+          "y": 150
+        },
+        "path": "0.0"
+      },
+      {
+        "role": "AXStaticText",
+        "label": "Your Mac is Ready for FileVault",
+        "bounds": {
+          "height": 22.5,
+          "width": 452,
+          "x": 494,
+          "y": 335
+        },
+        "enabled": true,
+        "path": "0.0.0.0"
+      },
+      {
+        "role": "AXStaticText",
+        "label": "FileVault keeps your Mac safe by encrypting your data and protecting it with the password you use to log in. If you forget your password, you can use your Recovery Key to reset it.",
+        "bounds": {
+          "height": 85,
+          "width": 452,
+          "x": 494,
+          "y": 355.5
+        },
+        "enabled": true,
+        "path": "0.0.0.1"
+      },
+      {
+        "role": "AXButton",
+        "label": "Turn On | Next Button",
+        "bounds": {
+          "height": 38,
+          "width": 130,
+          "x": 971,
+          "y": 693
+        },
+        "enabled": true,
+        "path": "0.0.1"
+      },
+      {
+        "role": "AXButton",
+        "label": "Not Now | Cancel Button",
+        "bounds": {
+          "height": 38,
+          "width": 130,
+          "x": 827,
+          "y": 693
+        },
+        "enabled": true,
+        "path": "0.0.2"
+      },
+      {
+        "role": "AXSheet",
+        "label": "alert | _NS:87",
+        "bounds": {
+          "height": 186,
+          "width": 260,
+          "x": 590,
+          "y": 357
+        },
+        "path": "0.0.4"
+      },
+      {
+        "role": "AXStaticText",
+        "label": "Mac Data Will Not Be Securely Encrypted | _NS:74",
+        "bounds": {
+          "height": 34,
+          "width": 218,
+          "x": 611,
+          "y": 376
+        },
+        "enabled": true,
+        "path": "0.0.4.0"
+      },
+      {
+        "role": "AXStaticText",
+        "label": "Are you sure you want to continue without FileVault? You can manage this at any time in Privacy & Security settings. | _NS:58",
+        "bounds": {
+          "height": 66,
+          "width": 218,
+          "x": 611,
+          "y": 418
+        },
+        "enabled": true,
+        "path": "0.0.4.1"
+      },
+      {
+        "role": "AXButton",
+        "label": "Continue | action-button-1",
+        "bounds": {
+          "height": 30,
+          "width": 112,
+          "x": 723,
+          "y": 498
+        },
+        "enabled": true,
+        "path": "0.0.4.3"
+      }
+    ]
+  },
+  "finished": {
+    "action": {
+      "label": "Get Started",
+      "role": "AXButton",
+      "method": "press"
+    },
+    "elements": [
+      {
+        "role": "AXWindow",
+        "label": "Window | iCloudEnableFDEUpsell",
+        "bounds": {
+          "height": 600,
+          "width": 800,
+          "x": 320,
+          "y": 150
+        },
+        "path": "0.0"
+      },
+      {
+        "role": "AXStaticText",
+        "label": "Your Mac is Ready for FileVault",
+        "bounds": {
+          "height": 22.5,
+          "width": 452,
+          "x": 494,
+          "y": 335
+        },
+        "enabled": true,
+        "path": "0.0.0.0"
+      },
+      {
+        "role": "AXStaticText",
+        "label": "FileVault keeps your Mac safe by encrypting your data and protecting it with the password you use to log in. If you forget your password, you can use your Recovery Key to reset it.",
+        "bounds": {
+          "height": 85,
+          "width": 452,
+          "x": 494,
+          "y": 355.5
+        },
+        "enabled": true,
+        "path": "0.0.0.1"
+      },
+      {
+        "role": "AXButton",
+        "label": "Turn On | Next Button",
+        "bounds": {
+          "height": 38,
+          "width": 130,
+          "x": 971,
+          "y": 693
+        },
+        "enabled": true,
+        "path": "0.0.1"
+      },
+      {
+        "role": "AXButton",
+        "label": "Not Now | Cancel Button",
+        "bounds": {
+          "height": 38,
+          "width": 130,
+          "x": 827,
+          "y": 693
+        },
+        "enabled": true,
+        "path": "0.0.2"
+      },
+      {
+        "role": "AXWindow",
+        "label": "",
+        "bounds": {
+          "height": 900,
+          "width": 1440,
+          "x": 0,
+          "y": 0
+        },
+        "path": "0.1"
+      },
+      {
+        "role": "AXButton",
+        "label": "Get Started",
+        "bounds": {
+          "height": 38,
+          "width": 108,
+          "x": 666,
+          "y": 763
+        },
+        "enabled": true,
+        "path": "0.1.3"
+      }
+    ]
+  }
+}
