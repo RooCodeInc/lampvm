@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """One detached worker per private VM; no idle observation ever stops a guest."""
 import argparse
-import fcntl
 import importlib.machinery
 import importlib.util
 import os
@@ -47,17 +46,19 @@ def work(state, name, ident):
     slots = cli.Slots(state)
     worker_lock = state / 'locks' / (cli.valid_name(name) + '-worker.lock')
     worker_lock.parent.mkdir(parents=True, exist_ok=True)
-    with worker_lock.open('a+') as handle:
-        deadline = time.monotonic() + 10
-        while True:
-            try:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                handle.seek(0)
-                if handle.read().strip() == ident or time.monotonic() > deadline:
-                    return  # An existing worker already handles this ticket.
-                time.sleep(.1)  # Previous cancelled/stopped ticket is exiting.
+    deadline = time.monotonic() + 10
+    while True:
+        handle = cli.flock_file(worker_lock)
+        if handle:
+            break
+        try:
+            holder = worker_lock.read_text().strip()
+        except FileNotFoundError:
+            holder = ''
+        if holder == ident or time.monotonic() > deadline:
+            return  # An existing worker already handles this ticket.
+        time.sleep(.1)  # Previous cancelled/stopped ticket is exiting.
+    with handle:
         handle.seek(0)
         handle.truncate()
         handle.write(ident)
@@ -83,13 +84,12 @@ def work(state, name, ident):
             try:
                 if phase in ('queued', 'booting'):
                     if phase == 'queued' and request['expires_at'] <= time.time():
-                        slots.update_request(name, ident, phase='expired')
+                        slots.update_request(name, ident, phase='expired', finished_at=time.time())
                         print('slot request expired; original waiting deadline reached', flush=True)
                         return
                     attempt_start(vm, slots, ident)
                 elif not vm.running():
                     slots.stopped(name)
-                    slots.update_request(name, ident, phase='stopped')
                     return
                 if slots.snapshot()['requests'][name]['phase'] in ('running', 'failed'):
                     holder = slots.snapshot()['holders'].get(name, {})

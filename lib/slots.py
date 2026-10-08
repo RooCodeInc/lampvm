@@ -4,8 +4,32 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import re
 import time
 import uuid
+
+RETAIN = 3600  # Seconds a finished request and its leftover files stay inspectable.
+OVER = ('stopped', 'cancelled', 'expired')
+
+
+def flock_file(path):
+    """Open and exclusively lock path without waiting; None while another process holds it.
+
+    The inode check means a lock file removed by prune is never mistaken for
+    the live one: every holder owns the file currently at that path.
+    """
+    while True:
+        handle = path.open('a+')
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if os.fstat(handle.fileno()).st_ino == os.stat(path).st_ino:
+                return handle
+        except BlockingIOError:
+            handle.close()
+            return None
+        except FileNotFoundError:
+            pass
+        handle.close()
 
 
 class Slots:
@@ -70,7 +94,7 @@ class Slots:
         with self.edit() as data:
             request = data['requests'].get(name)
             if request and request['phase'] == 'queued':
-                request['phase'] = 'cancelled'
+                request.update(phase='cancelled', finished_at=time.time())
 
     def started(self, name, request):
         now = time.time()
@@ -82,8 +106,88 @@ class Slots:
             holder.update(owner=request['owner'], idle_after=request['idle_after'])
 
     def stopped(self, name):
+        """The caller saw this VM stopped under its lifecycle lock; close its ticket too.
+
+        Closing here does not depend on a worker surviving to notice the stop.
+        """
         with self.edit() as data:
             data['holders'].pop(name, None)
+            request = data['requests'].get(name)
+            if request and request['phase'] in ('booting', 'running', 'failed'):
+                if request['phase'] != 'failed':
+                    request['phase'] = 'stopped'
+                request.setdefault('finished_at', time.time())
+
+    def worker_gone(self, name):
+        """Return the held worker lock if no worker lives for name, else None."""
+        (self.state / 'locks').mkdir(parents=True, exist_ok=True)
+        return flock_file(self.state / 'locks' / (name + '-worker.lock'))
+
+    def reap(self, machines):
+        """Close tickets whose worker died and whose VM Tart no longer runs.
+
+        machines is called for a fresh Tart listing while the dead worker's lock
+        is held, so no recovering worker can boot that VM in between.
+        """
+        now = time.time()
+        running = lambda: {m['Name'] for m in machines() if m.get('Source') == 'local' and m.get('Running')}
+        seen = running()
+        for name, request in self.snapshot()['requests'].items():
+            expired = request['phase'] == 'queued' and request['expires_at'] <= now
+            ended = request['phase'] in ('running', 'failed') and 'finished_at' not in request and name not in seen
+            if not expired and not ended:
+                continue
+            handle = self.worker_gone(name)
+            if not handle:
+                continue  # Its live worker records the outcome itself.
+            with handle:
+                if ended and name in running():
+                    continue
+                with self.edit() as data:
+                    current = data['requests'].get(name)
+                    if not current or current['id'] != request['id'] or current['phase'] != request['phase']:
+                        continue
+                    if ended:
+                        data['holders'].pop(name, None)
+                    if current['phase'] != 'failed':  # A failure stays readable until pruned.
+                        current['phase'] = 'expired' if expired else 'stopped'
+                    current['finished_at'] = now
+                    current['reaped'] = 'worker gone; ' + ('waiting deadline passed' if expired else 'VM not running')
+
+    def prune(self, machines, retain=RETAIN):
+        """Forget finished requests after retain seconds, then files of VMs that no longer exist."""
+        now = time.time()
+        with self.edit() as data:
+            for name, request in list(data['requests'].items()):
+                if request['phase'] not in OVER and not (request['phase'] == 'failed' and 'finished_at' in request):
+                    continue
+                # Records from before finished_at existed carry only these times.
+                finished = request.get('finished_at') or max(request.get('heartbeat') or 0, request['enqueued_at'])
+                if now - finished >= retain and name not in data['holders']:
+                    del data['requests'][name]
+            known = set(data['requests']) | set(data['holders'])
+        known |= {m['Name'] for m in machines()}
+        if (self.state / 'vms').is_dir():
+            known |= {p.stem for p in (self.state / 'vms').glob('*.json')}
+        old = lambda path: now - path.stat().st_mtime >= retain
+        gone = lambda name: name not in known and name != 'host-start'
+        removed = []
+        for path in sorted((self.state / 'logs').glob('*.log')):
+            match = re.fullmatch(r'(.+?)-(?:slot-)?[0-9a-f]{32}\.log', path.name)
+            if match and gone(match.group(1)) and old(path):
+                path.unlink(missing_ok=True)
+                removed.append(path.name)
+        for path in sorted((self.state / 'locks').glob('*.lock')):
+            name = path.name[:-len('.lock')]
+            # NAME-worker.lock is NAME's worker lock or the lifecycle lock of a VM so named.
+            if not gone(name) or name.endswith('-worker') and not gone(name[:-len('-worker')]) or not old(path):
+                continue
+            handle = flock_file(path)
+            if handle:
+                with handle:  # Unlinked while held: a waiter rechecks the inode and reopens.
+                    path.unlink(missing_ok=True)
+                removed.append(path.name)
+        return removed
 
     @contextlib.contextmanager
     def activity(self, name, command):

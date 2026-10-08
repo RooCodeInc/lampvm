@@ -12,7 +12,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
-from slots import Slots
+from slots import Slots, flock_file
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -78,6 +78,100 @@ class SlotContracts(unittest.TestCase):
                 self.assertEqual(len(self.slots.snapshot()['holders']['private']['active']), 1)
                 raise RuntimeError('failed')
         self.assertEqual(self.slots.snapshot()['holders']['private']['active'], {})
+
+    def running(self, name, **fields):
+        request = self.enqueue(name)
+        self.slots.started(name, request)
+        self.slots.update_request(name, request['id'], phase='running', **fields)
+        return request
+
+    def phase(self, name):
+        return self.slots.snapshot()['requests'][name]['phase']
+
+    def test_stop_closes_the_ticket_without_a_worker(self):
+        self.running('private')
+        self.slots.stopped('private')
+        data = self.slots.snapshot()
+        self.assertEqual(data['requests']['private']['phase'], 'stopped')
+        self.assertIn('finished_at', data['requests']['private'])
+        self.assertEqual(data['holders'], {})
+
+    def test_reap_closes_running_ticket_only_when_worker_and_vm_are_both_gone(self):
+        for name in ('dead', 'alive-vm', 'alive-worker'):
+            self.running(name)
+        machines = lambda: [dict(Name='alive-vm', Source='local', Running=True)]
+        (self.slots.state / 'locks').mkdir()
+        with flock_file(self.slots.state / 'locks/alive-worker-worker.lock'):
+            self.slots.reap(machines)
+        data = self.slots.snapshot()
+        self.assertEqual(data['requests']['dead']['phase'], 'stopped')
+        self.assertIn('worker gone', data['requests']['dead']['reaped'])
+        self.assertEqual(sorted(data['holders']), ['alive-vm', 'alive-worker'])
+        self.assertEqual(self.phase('alive-vm'), 'running')
+        self.assertEqual(self.phase('alive-worker'), 'running')
+
+    def test_reap_rechecks_tart_after_taking_the_worker_lock(self):
+        self.running('late')
+        listings = iter([[], [dict(Name='late', Source='local', Running=True)]])
+        self.slots.reap(lambda: next(listings))
+        self.assertEqual(self.phase('late'), 'running')
+
+    def test_reap_expires_dead_waiter_and_keeps_failure_readable(self):
+        with mock.patch('slots.time.time', return_value=100):
+            self.enqueue('late', 1)
+            self.enqueue('patient', 10 ** 10)
+        failed = self.enqueue('broken')
+        self.slots.update_request('broken', failed['id'], phase='failed', error='Boot timed out')
+        self.slots.reap(lambda: [])
+        data = self.slots.snapshot()['requests']
+        self.assertEqual(data['late']['phase'], 'expired')
+        self.assertEqual(data['patient']['phase'], 'queued')
+        self.assertEqual((data['broken']['phase'], data['broken']['error']), ('failed', 'Boot timed out'))
+        self.assertIn('finished_at', data['broken'])
+
+    def test_prune_forgets_only_old_finished_requests_and_files_of_vanished_vms(self):
+        state = self.slots.state
+        for folder in ('logs', 'locks', 'vms'):
+            (state / folder).mkdir()
+        ident = 'a' * 32
+        names = ('gone', 'recent', 'stopped-vm', 'marked', 'queued', 'holder', 'busy')
+        for name in names:
+            for file in ('logs/%s-slot-%s.log' % (name, ident), 'logs/%s-%s.log' % (name, ident),
+                         'locks/%s.lock' % name, 'locks/%s-worker.lock' % name):
+                (state / file).touch()
+                if name != 'recent':
+                    os.utime(state / file, (1000, 1000))
+        (state / 'locks/host-start.lock').touch()
+        os.utime(state / 'locks/host-start.lock', (1000, 1000))
+        (state / 'logs/notes.log').touch()
+        os.utime(state / 'logs/notes.log', (1000, 1000))
+        (state / 'vms/marked.json').write_text('{}')
+        with mock.patch('slots.time.time', return_value=1500):
+            for name in ('gone', 'stopped-vm', 'marked', 'busy'):  # Finished long ago, before finished_at existed.
+                self.slots.update_request(name, self.enqueue(name)['id'], phase='stopped', heartbeat=2000)
+        self.slots.cancel(self.enqueue('recent')['name'])
+        self.enqueue('queued')
+        self.running('holder')
+        with flock_file(state / 'locks/busy.lock'):
+            removed = self.slots.prune(lambda: [dict(Name='stopped-vm', Source='local', Running=False)])
+        self.assertEqual(sorted(self.slots.snapshot()['requests']), ['holder', 'queued', 'recent'])
+        left = sorted(p.name for folder in ('logs', 'locks') for p in (state / folder).iterdir())
+        expected = ['host-start.lock', 'notes.log', 'busy.lock']
+        for name in ('recent', 'stopped-vm', 'marked', 'queued', 'holder'):
+            expected += ['%s-slot-%s.log' % (name, ident), '%s-%s.log' % (name, ident), name + '.lock', name + '-worker.lock']
+        self.assertEqual(left, sorted(expected))
+        self.assertEqual(len(removed), 7)
+
+    def test_lock_removed_by_prune_is_never_held_as_a_stale_file(self):
+        path = self.slots.state / 'locks/private.lock'
+        path.parent.mkdir()
+        first = flock_file(path)
+        path.unlink()  # What prune does while holding it.
+        second = flock_file(path)  # A new file: the old holder does not block it.
+        self.assertEqual(os.fstat(second.fileno()).st_ino, path.stat().st_ino)
+        self.assertIsNone(flock_file(path))
+        first.close()
+        second.close()
 
 
 class DetachedProcessProof(unittest.TestCase):
@@ -206,6 +300,36 @@ class DetachedProcessProof(unittest.TestCase):
         self.until(lambda: self.request('two').get('phase') == 'running')
         self.assertEqual(json.loads(self.fake.read_text())['starts'], ['one', 'two'])
         self.assertEqual(self.cli('two', 'stop').returncode, 0)
+
+    def kill_worker_and_vm(self, name):
+        # What `pkill -f "lampvm.*NAME"` did to request 29: worker and VM die together.
+        self.free_external_slot()
+        self.assertEqual(self.cli(name, 'start', '--wait', '60', '--detach').returncode, 0)
+        self.until(lambda: self.request(name).get('phase') == 'running')
+        os.kill(self.request(name)['worker_pid'], signal.SIGKILL)
+        import fcntl
+        with self.fake.with_suffix('.lock').open('a') as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX)
+            data = json.loads(self.fake.read_text())
+            data['vms'][name] = False
+            self.fake.write_text(json.dumps(data))
+        self.assertEqual(self.request(name)['phase'], 'running')
+
+    def test_stop_after_worker_and_vm_were_killed_closes_the_ticket(self):
+        self.kill_worker_and_vm('one')
+        result = self.cli('one', 'stop')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.request('one')['phase'], 'stopped')
+        self.assertNotIn('one', self.slots.snapshot()['holders'])
+
+    def test_status_reaps_ticket_whose_worker_and_vm_were_killed(self):
+        self.kill_worker_and_vm('one')
+        report = json.loads(self.cli('two', 'status', '--json').stdout)
+        ticket = next(r for r in report['requests'] if r['name'] == 'one')
+        self.assertEqual(ticket['phase'], 'stopped')
+        self.assertIn('worker gone', ticket['reaped'])
+        self.assertNotIn('one', self.slots.snapshot()['holders'])
+        self.assertEqual(json.loads(self.fake.read_text()).get('stops', []), [])
 
     def test_expired_or_cancelled_ticket_never_starts(self):
         import fcntl

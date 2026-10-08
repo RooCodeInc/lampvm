@@ -100,6 +100,18 @@ with the same name to recover the saved ticket (or the monitor for an already
 running managed VM). Its waiting deadline still counts elapsed wall time. Host
 restart does not restart workers; retry unexpired tickets explicitly. Workers
 exit when their VM stops. There is no background shutdown/reaping service.
+
+`stop`, `destroy` and `reset` close the VM's ticket themselves, so a ticket never
+depends on its worker surviving. `status` also settles tickets against Tart: a
+`running` or `failed` ticket whose worker is gone (its worker lock is free) and
+whose VM Tart no longer runs is closed, and a waiter whose worker is gone is
+expired once its deadline passes. This never stops a VM. Never kill lampvm
+processes by name (`pkill -f lampvm...` also kills the worker and the VM); use `stop`.
+
+Finished tickets (stopped, cancelled, expired, or failed with the VM gone) stay
+in `status --json` for one hour, then `status` forgets them. Slot/boot logs and
+lock files older than an hour are deleted only for names that have no ticket, no
+holder, no ownership record and no Tart VM; a lock is removed only while held.
 The FIFO applies to this runtime state's updated `start` commands; old binaries,
 other state directories, direct Tart and provisioning `setup --wait-slot` do not
 participate. All local running VMs still count toward the two-slot capacity.
