@@ -67,7 +67,7 @@ class Slots:
                        if r['phase'] == 'queued' and r['expires_at'] > now),
                       key=lambda r: (r['sequence'], r['id']))
 
-    def enqueue(self, name, seconds, owner, config, tart, idle_after):
+    def enqueue(self, name, seconds, owner, config, tart, idle_after, session=None):
         now = time.time()
         with self.edit() as data:
             old = data['requests'].get(name)
@@ -76,6 +76,7 @@ class Slots:
                 return dict(old)  # Retries retain both original place and deadline.
             data['next_sequence'] = data.get('next_sequence', 0) + 1
             request = dict(sequence=data['next_sequence'], id=uuid.uuid4().hex, name=name, owner=owner,
+                           session=session,
                            enqueued_at=now, expires_at=now + seconds,
                            phase='queued', config=config, tart=str(tart),
                            idle_after=idle_after, heartbeat=None)
@@ -103,7 +104,7 @@ class Slots:
             holder = data['holders'].setdefault(name, {})
             holder.setdefault('started_at', now)
             holder.setdefault('last_used_at', now)
-            holder.update(owner=request['owner'], idle_after=request['idle_after'])
+            holder.update(owner=request['owner'], idle_after=request['idle_after'], session=request.get('session'))
 
     def stopped(self, name):
         """The caller saw this VM stopped under its lifecycle lock; close its ticket too.
@@ -250,16 +251,24 @@ class Slots:
             limit = 240 if request.get('phase') == 'booting' else 30
             monitor = ('responsive' if heartbeat and now-heartbeat < limit else
                        'stalled; rerun start to resume') if request else 'untracked'
-            holders.append({'name': name, **holder, **self.observation(holder, now), 'monitor': monitor})
+            # Tickets saved before sessions existed, and untracked VMs, have none.
+            holders.append({'name': name, **holder, **self.observation(holder, now), 'monitor': monitor,
+                            'session': holder.get('session') or request.get('session')})
         queue = []
         for position, request in enumerate(self.waiting(data, now), 1):
             heartbeat = request.get('heartbeat')
-            queue.append(dict(name=request['name'], owner=request['owner'], position=position,
+            queue.append(dict(name=request['name'], owner=request['owner'], session=request.get('session'), position=position,
                               enqueued_at=request['enqueued_at'], waited_seconds=round(now-request['enqueued_at']),
                               expires_at=request['expires_at'], remaining_seconds=round(request['expires_at']-now),
                               worker='responsive' if heartbeat and now-heartbeat < 30 else 'stalled; rerun start to resume',
                               log=request.get('log')))
         requests = [{k: v for k, v in r.items() if k not in ('config', 'tart')}
                     for r in data['requests'].values()]
-        return dict(limit=2, holders=holders, queue=queue, requests=requests,
+        groups = {}
+        for kind, entries in (('running', holders), ('queued', queue)):
+            for entry in entries:
+                group = groups.setdefault(entry['session'], dict(session=entry['session'], running=[], queued=[]))
+                group[kind].append(entry['name'])
+        sessions = sorted(groups.values(), key=lambda group: (group['session'] is None, group['session'] or ''))
+        return dict(limit=2, holders=holders, queue=queue, sessions=sessions, requests=requests,
                     estimate='unknown: guest jobs have no predictable completion time')

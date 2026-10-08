@@ -65,6 +65,13 @@ def lock(path, timeout=120):
         yield
 
 
+def valid_session(session):
+    # One token, so it stays the same on every start; --owner carries the prose.
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,79}", session):
+        raise Error("--session must be one task or thread id: letters, numbers, dot, dash, colon or underscore (max 80)")
+    return session
+
+
 @contextlib.contextmanager
 def locks(state, names):
     # Every lifecycle operation takes the same sorted order, including its source.
@@ -171,7 +178,7 @@ class VM:
             raise Error("Specify APP or configure app; there is no app-specific default")
         return app
 
-    def start(self, wait_seconds, owner=None, idle_after=600, detach=False):
+    def start(self, wait_seconds, owner=None, idle_after=600, detach=False, session=None):
         self.working()
         slots = Slots(self.state)
         already_running = self.running()
@@ -192,7 +199,10 @@ class VM:
                         bool(v.get("Running")) for v in self.machines() if v.get("Source") == "local") >= 2:
                     raise Error("Slots busy or queued; use start --wait SECONDS; status shows holders and line")
             request = existing if already_running else slots.enqueue(
-                self.name, wait_seconds or 30, owner or self.name, self.config, self.tart, idle_after)
+                self.name, wait_seconds or 30, owner or self.name, self.config, self.tart, idle_after, session)
+            if not request.get('session') and not (existing and existing['id'] == request['id']):
+                print("note: no --session (or LAMPVM_SESSION) task/thread id; status cannot group this VM with its session",
+                      file=sys.stderr, flush=True)
         logdir = self.state / "logs"
         logdir.mkdir(parents=True, exist_ok=True)
         logfile = logdir / (self.name + "-slot-" + request['id'] + ".log")
@@ -202,6 +212,7 @@ class VM:
                               str(self.state), self.name, request['id']],
                              stdin=subprocess.DEVNULL, stdout=stream, stderr=subprocess.STDOUT,
                              start_new_session=True)
+        launched = time.time()
         print("ticket: " + request['id'] + "; log: " + str(logfile), flush=True)
         if detach:
             return
@@ -225,7 +236,8 @@ class VM:
                       (phase, position or '-', time.time()-request['enqueued_at'],
                        max(0, request['expires_at']-time.time())), file=sys.stderr, flush=True)
                 previous = message
-            heartbeat = current.get('heartbeat') or request['enqueued_at']
+            # A resumed ticket's last heartbeat is its dead worker's; time the new one from its launch.
+            heartbeat = max(current.get('heartbeat') or request['enqueued_at'], launched)
             if time.time() - heartbeat > (240 if phase == 'booting' else 30):
                 raise Error("Detached worker stalled; rerun start to resume the same ticket/place")
             time.sleep(1)
@@ -396,11 +408,12 @@ def parser():
     q.add_argument("--wait-slot", type=int, default=0)
     add("build", "build host and guest helpers into external state")
     add("doctor", "check host dependencies and guest permissions")
-    q = add("start", "boot an owned VM headlessly")
+    q = add("start", "boot an owned VM headlessly; returns when it is ready for commands")
     q.add_argument("--wait", type=float, default=0, help="seconds to wait for a VM slot")
-    q.add_argument("--owner", help="session label shown beside holder and ticket")
+    q.add_argument("--session", help="task or thread id shared by every start of one session (or LAMPVM_SESSION); status groups by it")
+    q.add_argument("--owner", help="free description shown beside holder and ticket")
     q.add_argument("--idle-after", type=float, default=600, help="flag command silence after seconds; never stops the VM")
-    q.add_argument("--detach", action="store_true", help="return after queuing; detached worker starts and monitors the VM")
+    q.add_argument("--detach", action="store_true", help="return after queuing instead of when the VM is ready; rerun start without it to wait")
     add("stop", "shut down only the selected owned VM")
     q = add("status", "show all slot holders and durable FIFO queue")
     q.add_argument("--json", action="store_true")
@@ -538,7 +551,8 @@ def main():
                 raise Error("--wait must be finite and 0..86400 seconds")
             if not math.isfinite(args.idle_after) or not 1 <= args.idle_after <= 86400:
                 raise Error("--idle-after must be finite and 1..86400 seconds")
-            vm.start(args.wait, args.owner, args.idle_after, args.detach)
+            session = args.session or os.environ.get("LAMPVM_SESSION")
+            vm.start(args.wait, args.owner, args.idle_after, args.detach, valid_session(session) if session else None)
             return
         if cmd == "view":
             vm.view(args.vm or args.name or os.environ.get("LAMPVM_NAME"))
@@ -575,16 +589,23 @@ def main():
                 print("Slots: %s/2 running. ETA unknown." % len(report['holders']))
                 for holder in report['holders']:
                     since = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(holder['started_at'])) if holder.get('started_at') else 'unknown'
-                    print("  %s | owner %s | since %s | idle %ss | %s | monitor %s" %
-                          (holder['name'], holder.get('owner', 'unknown'), since,
+                    print("  %s | session %s | owner %s | since %s | idle %ss | %s | monitor %s" %
+                          (holder['name'], holder['session'] or '-', holder.get('owner', 'unknown'), since,
                            holder['idle_seconds'] if holder['idle_seconds'] is not None else '?', holder['attention'], holder['monitor']))
                 print("Queue:")
                 for ticket in report['queue']:
-                    print("  #%s %s | owner %s | waited %ss | remaining %ss | %s" %
-                          (ticket['position'], ticket['name'], ticket['owner'], ticket['waited_seconds'],
+                    print("  #%s %s | session %s | owner %s | waited %ss | remaining %ss | %s" %
+                          (ticket['position'], ticket['name'], ticket['session'] or '-', ticket['owner'], ticket['waited_seconds'],
                            ticket['remaining_seconds'], ticket['worker']))
                 if not report['queue']:
                     print("  empty")
+                if report['sessions']:
+                    print("Sessions:")
+                for group in report['sessions']:
+                    print("  %s: %s" % (group['session'] or 'no session id', "; ".join(
+                        ["running " + name for name in group['running']] +
+                        ["queued #%s %s" % (ticket['position'], ticket['name'])
+                         for ticket in report['queue'] if ticket['name'] in group['queued']])))
                 for request in report['requests']:
                     if request['phase'] in ('booting', 'failed', 'expired', 'cancelled'):
                         print("  %s: %s %s" % (request['name'], request['phase'], request.get('error', '')))

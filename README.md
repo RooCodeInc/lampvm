@@ -42,7 +42,7 @@ A guest has one keyboard, pointer, focus and desktop. Concurrent commands into t
 ```sh
 L=./bin/lampvm
 $L clone test-my-session
-$L --name test-my-session start
+$L --name test-my-session start   # returns when the VM is ready for commands
 $L --name test-my-session install /path/to/Test.app
 $L --name test-my-session launch Test
 $L --name test-my-session tree Test
@@ -60,17 +60,35 @@ creates a persistent FIFO ticket and launches a detached worker with no stdin or
 terminal dependency. Killing the calling shell/waiter does not cancel the ticket:
 the worker still starts that private VM when its turn arrives, until the original
 waiting deadline expires. Boot readiness is checked separately after admission.
-A retry for that name keeps its original place, owner, and deadline; extending
-`--wait` on a retry does not jump or prolong the queue. `--detach` returns as soon
-as the ticket is saved; use `status --json` to confirm the request phase is `running` before guest commands.
+A retry for that name keeps its original place, owner, session and deadline; extending
+`--wait` on a retry does not jump or prolong the queue.
+
+`start --wait SECONDS` is the one way to wait: it returns only when the VM has a
+slot, has booted and is ready for guest commands, printing `running: NAME` and
+exiting 0. Run the next guest command straight after it. Do not poll `status`
+for this: a booted VM that nobody is using still occupies one of the two slots
+while others queue. If your shell or agent tool cuts the command off first, the
+ticket and its place are kept: run the same line again and it resumes waiting,
+or returns at once if the VM became ready meanwhile. A nonzero exit names the
+reason (failed, expired, cancelled). `--detach` returns as soon as the ticket is
+saved, for a session that has other work to do while queued; when that work is
+done, run `start --wait SECONDS` without `--detach` to wait for the same ticket.
+
+Give every start of one session the same `--session ID` (or export
+`LAMPVM_SESSION`): the task or thread id your session already has, one token
+without spaces. `status` shows it on each holder and queued ticket and lists
+them per session, so a session holding one slot while queueing for another is
+visible. `--owner` remains a free description. Tickets saved without a session,
+and VMs started outside lampvm, keep working and are listed under `no session id`.
 
 ```sh
 export LAMPVM_NAME=test-my-session
+export LAMPVM_SESSION=t_abc123   # your task or thread id, the same on every start
 L=./bin/lampvm
-$L start --wait 3600 --owner "scenario session" --detach
-$L status                 # all holders, start times, idle time, queue order/age
+$L start --wait 3600 --owner "scenario session"   # returns when ready for commands
+$L status                 # all holders, start times, idle time, queue order/age, sessions
 $L status --json          # timestamps, last command, active work, logs, deadlines
-# Once running, declare a long scenario that runs inside the guest:
+# Declare a long scenario that runs inside the guest:
 $L hold --seconds 3600 --reason "40-minute scenario driven inside the guest"
 $L exec /path/to/scenario # foreground exec/sh are tracked while they run
 $L release-hold
@@ -140,16 +158,16 @@ Coordinates use screen points with the origin at the top left. They are not scre
 
 ## Commands
 
-Global selection: `--name NAME`, `--config FILE`, `--state-dir DIRECTORY`. Environment equivalents: `LAMPVM_NAME`, `LAMPVM_CONFIG`, `LAMPVM_STATE_DIR`; `LAMPVM_APP` sets a default target app; `LAMPVM_TART` selects an existing Tart executable. See `help` for exact argument order.
+Global selection: `--name NAME`, `--config FILE`, `--state-dir DIRECTORY`. Environment equivalents: `LAMPVM_NAME`, `LAMPVM_CONFIG`, `LAMPVM_STATE_DIR`; `LAMPVM_SESSION` is the task or thread id for `start`; `LAMPVM_APP` sets a default target app; `LAMPVM_TART` selects an existing Tart executable. See `help` for exact argument order.
 
 | Command | What it does |
 |---|---|
 | `setup` | Downloads dependencies, builds tools and prepares the guest and clean image. `--from VM` uses a stopped local source. |
 | `build` | Builds the host lock-state and guest input/inspection helpers into external state. |
 | `doctor` | Checks host dependencies, Accessibility and reported guest health, including unfinished Setup Assistant. It does not prove video consent or every interaction. |
-| `start [--wait SECONDS] [--detach]` | Durable FIFO admission, detached boot worker and idle observation. Default waits for the desktop; `--owner` labels the session. |
+| `start [--wait SECONDS] [--session ID] [--detach]` | Durable FIFO admission, detached boot worker and idle observation. Returns when the VM is ready for commands; rerun to resume the same ticket. `--session` (or `LAMPVM_SESSION`) is the task or thread id `status` groups by; `--owner` is a free description. `--detach` returns once the ticket is saved. |
 | `stop` | Shuts down the selected VM, then forces it off if graceful shutdown times out. |
-| `status [--json]` | Shows every local slot holder, activity/holds, worker health and FIFO line; includes host lock state if built. |
+| `status [--json]` | Shows every local slot holder, activity/holds, worker health and FIFO line, grouped per session (`sessions` in JSON); includes host lock state if built. |
 | `view [NAME]` | Opens a running VM in a Screen Sharing window on the host for a person to watch or use. Defaults to the selected VM, else the only one running. Takes no lock and records no activity. |
 | `cancel-start` | Cancels only the selected owned VM’s queued start. |
 | `hold --seconds N --reason TEXT` / `release-hold` | Declares/clears autonomous guest work; protects it from idle flags. |

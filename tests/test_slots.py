@@ -79,6 +79,30 @@ class SlotContracts(unittest.TestCase):
                 raise RuntimeError('failed')
         self.assertEqual(self.slots.snapshot()['holders']['private']['active'], {})
 
+    def test_status_groups_by_session_and_keeps_tickets_saved_without_one(self):
+        machines = []
+        for name, session in (('a-one', 't_abc123'), ('old-label', None)):
+            request = self.slots.enqueue(name, 100, 'first check', {}, '/fake', 600, session)
+            self.slots.started(name, request)
+            self.slots.update_request(name, request['id'], phase='running')
+            machines.append(dict(Name=name, Source='local', Running=True))
+        self.slots.enqueue('a-two', 100, 'a new label for the second start', {}, '/fake', 600, 't_abc123')
+        self.slots.enqueue('b-one', 100, 'other', {}, '/fake', 600, 'thread-9')
+        with self.slots.edit() as data:  # Written by a start from before sessions existed.
+            del data['requests']['old-label']['session'], data['holders']['old-label']['session']
+        machines.append(dict(Name='someone-else', Source='local', Running=True))
+        report = self.slots.report(machines)
+        self.assertEqual(report['sessions'], [
+            dict(session='t_abc123', running=['a-one'], queued=['a-two']),
+            dict(session='thread-9', running=[], queued=['b-one']),
+            dict(session=None, running=['old-label', 'someone-else'], queued=[])])
+        self.assertEqual([h['session'] for h in report['holders']], ['t_abc123', None, None])
+        self.assertEqual([q['session'] for q in report['queue']], ['t_abc123', 'thread-9'])
+
+    def test_retry_keeps_the_session_its_ticket_was_saved_with(self):
+        self.slots.enqueue('one', 100, 'one', {}, '/fake', 600, 't_abc123')
+        self.assertEqual(self.slots.enqueue('one', 100, 'one', {}, '/fake', 600, 'other')['session'], 't_abc123')
+
     def running(self, name, **fields):
         request = self.enqueue(name)
         self.slots.started(name, request)
@@ -300,6 +324,50 @@ class DetachedProcessProof(unittest.TestCase):
         self.until(lambda: self.request('two').get('phase') == 'running')
         self.assertEqual(json.loads(self.fake.read_text())['starts'], ['one', 'two'])
         self.assertEqual(self.cli('two', 'stop').returncode, 0)
+
+    def test_start_without_detach_returns_only_when_the_vm_is_ready_and_resumes_a_dead_worker(self):
+        self.assertEqual(self.cli('one', 'start', '--wait', '90', '--session', 't_abc123', '--detach').returncode, 0)
+        self.until(lambda: self.request('one').get('worker_pid'))
+        original = self.request('one')
+        os.kill(original['worker_pid'], signal.SIGKILL)
+        # Long dead: the waiter must time the worker it launches, not this heartbeat.
+        self.slots.update_request('one', original['id'], heartbeat=time.time()-300)
+        waiter = subprocess.Popen([str(ROOT/'bin/lampvm'), '--name', 'one', 'start', '--wait', '90'], env=self.env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.processes.append(waiter)
+        self.until(lambda: self.request('one').get('worker_pid') != original['worker_pid'])
+        time.sleep(1.5)
+        self.assertIsNone(waiter.poll(), 'returned while still queued')
+        self.free_external_slot()
+        out, err = waiter.communicate(timeout=20)
+        self.assertEqual(waiter.returncode, 0, err)
+        self.assertIn('running: one', out)
+        self.assertEqual((self.request('one')['id'], self.request('one')['phase']), (original['id'], 'running'))
+        again = self.cli('one', 'start', '--wait', '90')
+        self.assertEqual((again.returncode, self.request('one')['id']), (0, original['id']), again.stderr)
+        self.assertIn('running: one', again.stdout)
+        report = json.loads(self.cli('one', 'status', '--json').stdout)
+        self.assertIn(dict(session='t_abc123', running=['one'], queued=[]), report['sessions'])
+        text = self.cli('one', 'status').stdout
+        self.assertIn('one | session t_abc123 | owner one |', text)
+        self.assertIn('  t_abc123: running one', text)
+        self.assertEqual(self.cli('one', 'stop').returncode, 0)
+
+    def test_session_comes_from_flag_or_environment_and_must_be_one_id(self):
+        self.env['LAMPVM_SESSION'] = 'thread-9'
+        result = self.cli('one', 'start', '--wait', '60', '--detach')
+        self.assertEqual((result.returncode, self.request('one')['session']), (0, 'thread-9'), result.stderr)
+        self.assertNotIn('note:', result.stderr)
+        del self.env['LAMPVM_SESSION']
+        result = self.cli('two', 'start', '--wait', '60', '--session', 'two words', '--detach')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.request('two'), {})
+        result = self.cli('two', 'start', '--wait', '60', '--owner', 'an old label', '--detach')
+        self.assertEqual((result.returncode, self.request('two')['session']), (0, None), result.stderr)
+        self.assertIn('note: no --session', result.stderr)
+        self.assertNotIn('note:', self.cli('two', 'start', '--wait', '60', '--detach').stderr)
+        for name in ('one', 'two'):
+            self.assertEqual(self.cli(name, 'cancel-start').returncode, 0)
 
     def kill_worker_and_vm(self, name):
         # What `pkill -f "lampvm.*NAME"` did to request 29: worker and VM die together.
