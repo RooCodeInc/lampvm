@@ -4,6 +4,7 @@ This is a command-line tool for agents that test macOS apps in disposable Tart V
 Read README.md before installing it. The host screen and the user's applications are not test surfaces.
 
 - Never operate another session's VM. Use a private named clone and release only that clone.
+- A person can watch or use any running VM with `bin/lampvm view [NAME]`. Offer that command; do not run it for them unprompted, since it opens a window on their screen. Expect shared pointer/keyboard while it is open.
 - Keep credentials, personal app data, signing keys, VM disks, logs, screenshots and recordings out of git.
 - Do not replace owned VMs manually with Tart: ownership records must describe the same VM throughout its lifetime.
 - Keep runtime state outside this checkout. Setup configuration templates are read-only inputs.

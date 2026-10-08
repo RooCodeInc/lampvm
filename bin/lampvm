@@ -8,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -34,6 +35,14 @@ def run(argv, **kwargs):
 
 def output(argv):
     return run(argv, stdout=subprocess.PIPE, text=True).stdout.strip()
+
+
+def reachable(host, port):
+    try:
+        with socket.create_connection((host, port), timeout=3):
+            return True
+    except OSError:
+        return False
 
 
 def valid_name(name):
@@ -269,6 +278,32 @@ class VM:
         self.t("stop", self.name)
         print("stopped (forced): " + self.name)
 
+    def view(self, explicit=None):
+        """Open the guest desktop for a person. Never touches slot activity or locks."""
+        if explicit:
+            self.name = valid_name(explicit)
+        else:
+            running = sorted(v["Name"] for v in self.machines() if v.get("Source") == "local" and v.get("Running") and self.marker(v["Name"]).is_file())
+            if not running:
+                raise Error("No VM is running, so there is nothing to look at. An agent starts one with lampvm start; lampvm status lists them.")
+            if len(running) > 1:
+                raise Error("More than one VM is running. Choose one:\n" + "\n".join("  lampvm view " + name for name in running))
+            self.name = running[0]
+        self.need()
+        address = self.tout("ip", self.name)
+        if not re.fullmatch(r"[0-9.]+", address):
+            raise Error("Tart reported no usable address for " + self.name)
+        if not reachable(address, 5900):
+            raise Error("Screen Sharing is off in this guest (port 5900 closed); enable it in the guest's Sharing settings")
+        user, password = self.config.get("user", "admin"), self.config.get("password", "admin")
+        run(["/usr/bin/open", "vnc://%s:%s@%s" % (user, password, address)])
+        helper = self.state / "bin/lockstate"
+        if helper.exists() and output([helper]) == "locked":
+            print("This Mac's screen is locked; the window appears once you unlock it.")
+        print("Opening %s in Screen Sharing. If it asks for a type, keep Standard and click Continue.\n"
+              "Guest login if asked: %s / %s. You share one pointer and keyboard with the agent using this VM.\n"
+              "Close the window when done; the VM keeps running." % (self.name, user, password))
+
     def push(self, source, dest):
         src = Path(source).expanduser().resolve()
         if not src.exists():
@@ -374,6 +409,8 @@ def parser():
     add("stop", "shut down only the selected owned VM")
     q = add("status", "show all slot holders and durable FIFO queue")
     q.add_argument("--json", action="store_true")
+    q = add("view", "open a running VM in a window on this Mac, to watch or use by hand")
+    q.add_argument("vm", nargs="?", help="VM to show; defaults to the selected VM, else the only one running")
     add("cancel-start", "cancel only the selected VM's queued start")
     q = add("hold", "declare guest work without lampvm commands")
     q.add_argument("--seconds", type=float, required=True)
@@ -493,7 +530,7 @@ def main():
     vm.require_tart()
     # Recording and waits deliberately release the action lock so another call
     # can cause the change they observe. Captures have unique names on both sides.
-    unlocked = cmd in ["start", "record", "wait", "assert", "status", "tree", "find", "windows", "bounds"]
+    unlocked = cmd in ["start", "view", "record", "wait", "assert", "status", "tree", "find", "windows", "bounds"]
     lifecycle_names = [vm.name]
     if cmd == "clone":
         lifecycle_names = [valid_name(args.target), valid_name(args.source or vm.clean)]
@@ -507,6 +544,9 @@ def main():
             if not math.isfinite(args.idle_after) or not 1 <= args.idle_after <= 86400:
                 raise Error("--idle-after must be finite and 1..86400 seconds")
             vm.start(args.wait, args.owner, args.idle_after, args.detach)
+            return
+        if cmd == "view":
+            vm.view(args.vm or args.name or os.environ.get("LAMPVM_NAME"))
             return
         if cmd == "cancel-start":
             vm.working()

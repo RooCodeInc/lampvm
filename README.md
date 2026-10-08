@@ -1,6 +1,16 @@
 # lampvm
 
-A command-line toolkit for agents that test Mac apps inside a disposable macOS VM. It runs without a VM window on the host, so the host can stay locked or be used by someone else. Input, Accessibility inspection, screenshots and recording happen in the guest. No host Accessibility or Screen Recording permission is needed.
+A command-line toolkit for agents that test Mac apps inside a disposable macOS VM. It runs without a VM window on the host unless a person asks for one with `view`, so the host can stay locked or be used by someone else. Input, Accessibility inspection, screenshots and recording happen in the guest. No host Accessibility or Screen Recording permission is needed.
+
+## Watch or use the VM yourself
+
+Agents drive the VM, but a person can open it too:
+
+```sh
+bin/lampvm view
+```
+
+This opens the running VM in a Screen Sharing window on this Mac, with your mouse and keyboard working inside it. If Screen Sharing asks for a type, keep Standard and click Continue. With more than one VM running it lists them; pick one with `bin/lampvm view NAME` (`bin/lampvm status` shows who holds each). Close the window when done: the VM keeps running, and its holder, queue place and idle tracking are untouched. You share one pointer and keyboard with the agent, so watch while it works and take over when it is waiting. Input by hand does not count as an agent command for idle flags.
 
 ## Install from a clean Mac
 
@@ -128,6 +138,7 @@ Global selection: `--name NAME`, `--config FILE`, `--state-dir DIRECTORY`. Envir
 | `start [--wait SECONDS] [--detach]` | Durable FIFO admission, detached boot worker and idle observation. Default waits for the desktop; `--owner` labels the session. |
 | `stop` | Shuts down the selected VM, then forces it off if graceful shutdown times out. |
 | `status [--json]` | Shows every local slot holder, activity/holds, worker health and FIFO line; includes host lock state if built. |
+| `view [NAME]` | Opens a running VM in a Screen Sharing window on the host for a person to watch or use. Defaults to the selected VM, else the only one running. Takes no lock and records no activity. |
 | `cancel-start` | Cancels only the selected owned VM’s queued start. |
 | `hold --seconds N --reason TEXT` / `release-hold` | Declares/clears autonomous guest work; protects it from idle flags. |
 | `apps` | Lists running guest apps with process names, bundle IDs, PIDs and frontmost status. |

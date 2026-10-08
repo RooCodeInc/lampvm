@@ -152,6 +152,59 @@ class CLISafetyTests(IsolatedState, unittest.TestCase):
                 cli.valid_name(name)
 
 
+class ViewTests(IsolatedState, unittest.TestCase):
+    def own(self, vm, *names):
+        vm.marker().parent.mkdir(exist_ok=True)
+        for name in names:
+            vm.marker(name).write_text(json.dumps({"name": name}))
+
+    def view(self, vm, arguments, running, port=True):
+        machines = [{"Name": name, "Source": "local", "Running": True} for name in running]
+        with mock.patch.object(vm, "machines", return_value=machines), mock.patch.object(vm, "tout", return_value="192.168.64.9"), \
+             mock.patch.object(cli, "reachable", return_value=port), mock.patch.object(cli, "run") as opened:
+            try:
+                self.invoke(["view", *arguments], vm)
+            finally:
+                self.opened = opened
+
+    def test_view_opens_selected_vm_without_touching_slots_or_action_lock(self):
+        vm = self.vm()
+        self.own(vm, "private-test")
+        # A held action lock stands for the agent's command in progress.
+        with cli.lock(self.state / "locks" / "private-test.lock", timeout=0):
+            self.view(vm, [], ["private-test"])
+        self.opened.assert_called_once_with(["/usr/bin/open", "vnc://admin:admin@192.168.64.9"])
+        self.assertFalse((self.state / "slots.json").exists(), "watching must not count as agent activity")
+
+    def test_view_without_a_name_shows_the_only_running_vm(self):
+        vm = self.vm()
+        self.own(vm, "agent-vm", "stopped-vm")
+        with mock.patch.dict(cli.os.environ, {"LAMPVM_NAME": ""}):
+            self.view(vm, [], ["agent-vm", "not-lampvm"])
+        self.assertEqual(vm.name, "agent-vm")
+        self.opened.assert_called_once()
+
+    def test_view_lists_choices_when_two_are_running(self):
+        vm = self.vm()
+        self.own(vm, "agent-a", "agent-b")
+        with mock.patch.dict(cli.os.environ, {"LAMPVM_NAME": ""}):
+            with self.assertRaisesRegex(cli.Error, "lampvm view agent-a\n  lampvm view agent-b"):
+                self.view(vm, [], ["agent-a", "agent-b"])
+            self.view(vm, ["agent-b"], ["agent-a", "agent-b"])
+        self.assertEqual(vm.name, "agent-b")
+
+    def test_view_opens_nothing_when_stopped_unowned_or_sharing_is_off(self):
+        vm = self.vm()
+        self.own(vm, "private-test")
+        for arguments, running, port, message in [([], [], True, "isn't running"), (["stranger"], ["stranger"], True, "ownership record"),
+                                                  ([], ["private-test"], False, "Screen Sharing is off")]:
+            with self.subTest(message=message), self.assertRaisesRegex(cli.Error, message):
+                self.view(vm, arguments, running, port)
+            self.opened.assert_not_called()
+        with mock.patch.dict(cli.os.environ, {"LAMPVM_NAME": ""}), self.assertRaisesRegex(cli.Error, "No VM is running"):
+            self.view(vm, [], [])
+
+
 class CaptureSafetyTests(IsolatedState, unittest.TestCase):
     def artifact_args(self, file=None):
         return argparse.Namespace(app=None, file=file, seconds=1)
