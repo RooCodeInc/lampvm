@@ -83,7 +83,7 @@ and VMs started outside lampvm, keep working and are listed under `no session id
 
 ```sh
 export LAMPVM_NAME=test-my-session
-export LAMPVM_SESSION=t_abc123   # your task or thread id, the same on every start
+export LAMPVM_SESSION="<your task or thread id>"   # one token such as t_abc123, the same on every start
 L=./bin/lampvm
 $L start --wait 3600 --owner "scenario session"   # returns when ready for commands
 $L status                 # all holders, start times, idle time, queue order/age, sessions
