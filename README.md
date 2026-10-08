@@ -119,6 +119,12 @@ running managed VM). Its waiting deadline still counts elapsed wall time. Host
 restart does not restart workers; retry unexpired tickets explicitly. Workers
 exit when their VM stops. There is no background shutdown/reaping service.
 
+Between starting and finishing, three rules keep a session from queueing twice:
+
+- Keep the VM running under its hold through a rebuild or any pause of a few minutes, and reinstall the new build into it.
+- `stop` or `destroy` only when you are done or away for long: they give the slot up, and `start` after `stop` joins the back of the line.
+- `reset --yes` only when you need a clean guest: it keeps the slot and leaves the VM running, so `stop` or `destroy` afterwards.
+
 `reset --yes` on a running VM is for a clean guest in the middle of one session's
 work: it stops the VM, replaces it from its clean source and boots it again
 without giving up the slot, returning when the new guest is ready for commands.
