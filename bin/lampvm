@@ -203,15 +203,7 @@ class VM:
             if not request.get('session') and not (existing and existing['id'] == request['id']):
                 print("note: no --session (or LAMPVM_SESSION) task/thread id; status cannot group this VM with its session",
                       file=sys.stderr, flush=True)
-        logdir = self.state / "logs"
-        logdir.mkdir(parents=True, exist_ok=True)
-        logfile = logdir / (self.name + "-slot-" + request['id'] + ".log")
-        slots.update_request(self.name, request['id'], log=str(logfile))
-        with logfile.open('ab') as stream:
-            subprocess.Popen([sys.executable, str(ROOT / "lib/slots_worker.py"),
-                              str(self.state), self.name, request['id']],
-                             stdin=subprocess.DEVNULL, stdout=stream, stderr=subprocess.STDOUT,
-                             start_new_session=True)
+        logfile = self.launch_worker(request)
         launched = time.time()
         print("ticket: " + request['id'] + "; log: " + str(logfile), flush=True)
         if detach:
@@ -241,6 +233,50 @@ class VM:
             if time.time() - heartbeat > (240 if phase == 'booting' else 30):
                 raise Error("Detached worker stalled; rerun start to resume the same ticket/place")
             time.sleep(1)
+
+    def launch_worker(self, request):
+        """Start the ticket's detached worker; one that finds a live worker for it exits."""
+        logdir = self.state / "logs"
+        logdir.mkdir(parents=True, exist_ok=True)
+        logfile = logdir / (self.name + "-slot-" + request['id'] + ".log")
+        Slots(self.state).update_request(self.name, request['id'], log=str(logfile))
+        with logfile.open('ab') as stream:
+            subprocess.Popen([sys.executable, str(ROOT / "lib/slots_worker.py"),
+                              str(self.state), self.name, request['id']],
+                             stdin=subprocess.DEVNULL, stdout=stream, stderr=subprocess.STDOUT,
+                             start_new_session=True)
+        return logfile
+
+    def reset(self, clean):
+        """Called with the lifecycle locks of this VM and its clean source held."""
+        slots = Slots(self.state)
+        replace = lambda: (self.t("delete", self.name), self.t("clone", clean, self.name))
+        request = slots.snapshot()['requests'].get(self.name)
+        if not (request and request['phase'] in ('running', 'failed') and self.running()):
+            # No slot to keep. A queued ticket keeps its place: its worker boots the new copy.
+            self.stop()
+            slots.stopped(self.name)
+            replace()
+            print("reset (stopped): " + self.name)
+            return
+        # Holding host-start admits nobody into the slot this VM leaves for a moment.
+        # Every step below is bounded, and a reset that fails ends without the slot.
+        with lock(self.state / "locks/host-start.lock", timeout=300), slots.activity(self.name, "reset"):
+            slots.update_request(self.name, request['id'], phase='booting', heartbeat=time.time())
+            try:
+                self.stop()
+                replace()
+                self.ctl = None
+                self.boot()
+            except BaseException as error:
+                if self.running():
+                    slots.update_request(self.name, request['id'], phase='failed', error=str(error))
+                else:
+                    slots.stopped(self.name)
+                raise
+            slots.restarted(self.name, request['id'])
+        self.launch_worker(request)
+        print("reset (running, slot kept): " + self.name)
 
     def boot(self, on_launch=lambda: None):
         """Called only with the VM lifecycle and host-start locks held."""
@@ -431,7 +467,7 @@ def parser():
     q.add_argument("--from", dest="source", help="source VM; defaults to configured clean copy")
     q = add("destroy", "delete only the selected owned VM")
     q.add_argument("--yes", action="store_true", required=True)
-    q = add("reset", "replace owned VM with its configured stopped clean copy")
+    q = add("reset", "replace owned VM with its clean copy; a running VM reboots in the slot it holds")
     q.add_argument("--yes", action="store_true", required=True)
     q = add("install", "copy a built .app into guest /Applications")
     q.add_argument("source")
@@ -589,9 +625,10 @@ def main():
                 print("Slots: %s/2 running. ETA unknown." % len(report['holders']))
                 for holder in report['holders']:
                     since = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(holder['started_at'])) if holder.get('started_at') else 'unknown'
-                    print("  %s | session %s | owner %s | since %s | idle %ss | %s | monitor %s" %
+                    print("  %s | session %s | owner %s | since %s | idle %ss | %s | monitor %s%s" %
                           (holder['name'], holder['session'] or '-', holder.get('owner', 'unknown'), since,
-                           holder['idle_seconds'] if holder['idle_seconds'] is not None else '?', holder['attention'], holder['monitor']))
+                           holder['idle_seconds'] if holder['idle_seconds'] is not None else '?', holder['attention'], holder['monitor'],
+                           " | resets %s" % holder['resets'] if holder.get('resets') else ""))
                 print("Queue:")
                 for ticket in report['queue']:
                     print("  #%s %s | session %s | owner %s | waited %ss | remaining %ss | %s" %
@@ -646,12 +683,7 @@ def main():
             source = [v for v in vm.machines() if v["Name"] == clean and v.get("Source") == "local"]
             if not source or source[0].get("Running"):
                 raise Error("Clean copy must exist and be stopped")
-            Slots(vm.state).cancel(vm.name)
-            vm.stop()
-            Slots(vm.state).stopped(vm.name)
-            vm.t("delete", vm.name)
-            vm.t("clone", clean, vm.name)
-            print("reset (stopped): " + vm.name)
+            vm.reset(clean)
             return
         vm.need()
         with Slots(vm.state).activity(vm.name, cmd):

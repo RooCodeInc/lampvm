@@ -88,8 +88,7 @@ def work(state, name, ident):
                         print('slot request expired; original waiting deadline reached', flush=True)
                         return
                     attempt_start(vm, slots, ident)
-                elif not vm.running():
-                    slots.stopped(name)
+                elif not vm.running() and slots.stopped(name, ('running', 'failed')):
                     return
                 if slots.snapshot()['requests'][name]['phase'] in ('running', 'failed'):
                     holder = slots.snapshot()['holders'].get(name, {})

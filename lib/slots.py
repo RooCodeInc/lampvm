@@ -106,18 +106,40 @@ class Slots:
             holder.setdefault('last_used_at', now)
             holder.update(owner=request['owner'], idle_after=request['idle_after'], session=request.get('session'))
 
-    def stopped(self, name):
+    def stopped(self, name, phases=('booting', 'running', 'failed')):
         """The caller saw this VM stopped under its lifecycle lock; close its ticket too.
 
         Closing here does not depend on a worker surviving to notice the stop.
+        A worker, which holds no lifecycle lock, passes the phases it may close:
+        a reset keeping the slot shows as booting while its VM is down. False
+        means the ticket was left alone.
         """
         with self.edit() as data:
-            data['holders'].pop(name, None)
             request = data['requests'].get(name)
-            if request and request['phase'] in ('booting', 'running', 'failed'):
+            if request and request['phase'] in {'booting', 'running', 'failed'} - set(phases):
+                return False
+            data['holders'].pop(name, None)
+            if request and request['phase'] in phases:
                 if request['phase'] != 'failed':
                     request['phase'] = 'stopped'
                 request.setdefault('finished_at', time.time())
+            return True
+
+    def restarted(self, name, ident):
+        """A reset rebooted this VM without giving up its slot: same ticket, same tenure."""
+        now = time.time()
+        with self.edit() as data:
+            request = data['requests'].get(name)
+            if not request or request['id'] != ident:
+                return False
+            request.update(phase='running', heartbeat=now)
+            for key in ('finished_at', 'error'):
+                request.pop(key, None)
+            holder = data['holders'].setdefault(name, {})
+            holder.setdefault('started_at', now)
+            holder.update(owner=request['owner'], idle_after=request['idle_after'], session=request.get('session'),
+                          last_used_at=now, resets=holder.get('resets', 0) + 1)
+            return True
 
     def worker_gone(self, name):
         """Return the held worker lock if no worker lives for name, else None."""

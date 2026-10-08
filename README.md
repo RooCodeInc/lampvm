@@ -51,7 +51,7 @@ $L --name test-my-session stop
 $L --name test-my-session destroy --yes
 ```
 
-`clone` uses the configured clean VM; `clone NAME --from STOPPED_VM` selects another clean source. Cloning shares disk blocks initially, but changes consume storage. `destroy --yes` deletes only the selected owned working VM. Clean-image ownership records are protected from start, destroy and reset. Use `reset --yes` only on your working VM; it replaces that VM from its recorded stopped clean source. Do not select the clean image for destructive commands.
+`clone` uses the configured clean VM; `clone NAME --from STOPPED_VM` selects another clean source. Cloning shares disk blocks initially, but changes consume storage. `destroy --yes` deletes only the selected owned working VM. Clean-image ownership records are protected from start, destroy and reset. Use `reset --yes` only on your working VM; it replaces that VM from its recorded stopped clean source, and a running VM comes back running in the slot it held. Do not select the clean image for destructive commands.
 
 ## Share the two running slots
 
@@ -119,8 +119,18 @@ running managed VM). Its waiting deadline still counts elapsed wall time. Host
 restart does not restart workers; retry unexpired tickets explicitly. Workers
 exit when their VM stops. There is no background shutdown/reaping service.
 
-`stop`, `destroy` and `reset` close the VM's ticket themselves, so a ticket never
-depends on its worker surviving. `status` also settles tickets against Tart: a
+`reset --yes` on a running VM is for a clean guest in the middle of one session's
+work: it stops the VM, replaces it from its clean source and boots it again
+without giving up the slot, returning when the new guest is ready for commands.
+Nobody is admitted in between, the ticket and its start time stay the same, and
+`status` counts the resets. It cannot hold a slot open: each step is bounded, and
+a reset that fails closes the ticket unless the VM was left running for
+inspection. A stopped VM is reset as before and stays stopped; one that is still
+queued keeps its place in line. `stop` and `destroy` give the slot up at once, and
+a `start` after `stop` joins the back of the line.
+
+`stop` and `destroy` close the VM's ticket themselves, as does a `reset` that leaves
+its VM stopped, so a ticket never depends on its worker surviving. `status` also settles tickets against Tart: a
 `running` or `failed` ticket whose worker is gone (its worker lock is free) and
 whose VM Tart no longer runs is closed, and a waiter whose worker is gone is
 expired once its deadline passes. This never stops a VM. Never kill lampvm
@@ -175,7 +185,7 @@ Global selection: `--name NAME`, `--config FILE`, `--state-dir DIRECTORY`. Envir
 | `ocr [--app APP]` | Reads visible text with offline Apple Vision OCR, including confidence and text boxes in image pixels. App captures include `screenOriginPoints` and `pixelsPerPoint` conversion; boxes have a top-left image origin. |
 | `clone NAME [--from VM]` | Creates a separate working VM from a stopped clean source. |
 | `destroy --yes` | Stops and deletes the selected owned working VM; clean images are protected. |
-| `reset --yes` | Replaces the selected working VM with a fresh clone of the configured clean image. |
+| `reset --yes` | Replaces the selected working VM with a fresh clone of the configured clean image. A running VM reboots in the slot it holds and is ready when the command returns; a stopped one stays stopped. |
 | `install PATH` | Copies an app to guest `/Applications`, quits the previous copy and clears copied extended attributes. |
 | `launch [APP] [ARGS…]` | Opens an app, passing optional launch arguments. |
 | `quit [APP]` | Requests that an app quit. |

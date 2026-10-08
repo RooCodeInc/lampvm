@@ -53,6 +53,14 @@ elif command == 'exec':
         print('/guest/vmctl')
     elif guest[0] == '/guest/vmctl':
         print('[]' if guest[1] in ('tree', 'windows') else 'true')
+elif command == 'delete':
+    with edit() as data:
+        del data['vms'][args[1]]
+elif command == 'clone':
+    with edit() as data:
+        if data.get('fail_clone'):
+            sys.exit(4)
+        data['vms'][args[2]] = False
 elif command == 'stop':
     with edit() as data:
         data['vms'][args[1]] = False

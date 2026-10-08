@@ -120,6 +120,18 @@ class SlotContracts(unittest.TestCase):
         self.assertIn('finished_at', data['requests']['private'])
         self.assertEqual(data['holders'], {})
 
+    def test_worker_cannot_close_a_ticket_whose_reset_is_keeping_the_slot(self):
+        request = self.running('private')
+        started_at = self.slots.snapshot()['holders']['private']['started_at']
+        self.slots.update_request('private', request['id'], phase='booting')  # What reset does before stopping.
+        self.assertFalse(self.slots.stopped('private', ('running', 'failed')))
+        self.assertEqual(self.phase('private'), 'booting')
+        self.assertTrue(self.slots.restarted('private', request['id']))
+        holder = self.slots.snapshot()['holders']['private']
+        self.assertEqual((self.phase('private'), holder['started_at'], holder['resets']), ('running', started_at, 1))
+        self.assertTrue(self.slots.stopped('private', ('running', 'failed')))
+        self.assertEqual(self.phase('private'), 'stopped')
+
     def test_reap_closes_running_ticket_only_when_worker_and_vm_are_both_gone(self):
         for name in ('dead', 'alive-vm', 'alive-worker'):
             self.running(name)
@@ -368,6 +380,64 @@ class DetachedProcessProof(unittest.TestCase):
         self.assertNotIn('note:', self.cli('two', 'start', '--wait', '60', '--detach').stderr)
         for name in ('one', 'two'):
             self.assertEqual(self.cli(name, 'cancel-start').returncode, 0)
+
+    def fake_edit(self, change):
+        import fcntl
+        with self.fake.with_suffix('.lock').open('a') as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX)
+            data = json.loads(self.fake.read_text())
+            change(data)
+            self.fake.write_text(json.dumps(data))
+
+    def hold_slot_with_a_waiter_behind(self):
+        self.fake_edit(lambda data: data['vms'].update({'lampvm-clean': False, 'external-a': False}))
+        self.assertEqual(self.cli('one', 'start', '--wait', '60').returncode, 0)
+        self.assertEqual(self.cli('two', 'start', '--wait', '60', '--detach').returncode, 0)
+        self.until(lambda: self.request('two').get('worker_pid'))
+        return self.request('one'), self.slots.snapshot()['holders']['one']
+
+    def test_reset_keeps_the_slot_ahead_of_a_waiter_and_stop_gives_it_up(self):
+        ticket, holder = self.hold_slot_with_a_waiter_behind()
+        result = self.cli('one', 'reset', '--yes')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('reset (running, slot kept): one', result.stdout)
+        fake = json.loads(self.fake.read_text())
+        self.assertEqual((fake['starts'], fake['vms']['one']), (['one', 'one'], True))
+        after, kept = self.request('one'), self.slots.snapshot()['holders']['one']
+        self.assertEqual((after['id'], after['phase']), (ticket['id'], 'running'))
+        self.assertEqual((kept['started_at'], kept['resets']), (holder['started_at'], 1))
+        time.sleep(2.5)  # The waiter's worker has had its turns; the monitor is still the same one.
+        self.assertEqual(self.request('two')['phase'], 'queued')
+        self.assertEqual((self.request('one')['phase'], self.request('one')['worker_pid']), ('running', ticket['worker_pid']))
+        self.assertIn('| resets 1', self.cli('one', 'status').stdout)
+        self.assertEqual(self.cli('one', 'stop').returncode, 0)
+        self.until(lambda: self.request('two').get('phase') == 'running')
+        self.assertEqual(self.cli('two', 'stop').returncode, 0)
+
+    def test_reset_that_fails_gives_up_the_slot(self):
+        self.hold_slot_with_a_waiter_behind()
+        self.fake_edit(lambda data: data.update(fail_clone=True))
+        self.assertNotEqual(self.cli('one', 'reset', '--yes').returncode, 0)
+        self.assertEqual(self.request('one')['phase'], 'stopped')
+        self.assertNotIn('one', self.slots.snapshot()['holders'])
+        self.until(lambda: self.request('two').get('phase') == 'running')
+        self.assertEqual(self.cli('two', 'stop').returncode, 0)
+
+    def test_reset_while_queued_keeps_the_place_in_line(self):
+        self.fake_edit(lambda data: data['vms'].update({'lampvm-clean': False}))
+        for name in ('one', 'two'):
+            self.assertEqual(self.cli(name, 'start', '--wait', '60', '--detach').returncode, 0)
+        ticket = self.request('one')
+        result = self.cli('one', 'reset', '--yes')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('reset (stopped): one', result.stdout)
+        self.assertEqual([r['id'] for r in self.slots.waiting(self.slots.snapshot(), time.time())],
+                         [ticket['id'], self.request('two')['id']])
+        self.free_external_slot()
+        self.until(lambda: self.request('one').get('phase') == 'running')
+        self.assertEqual(self.request('two')['phase'], 'queued')
+        for name in ('one', 'two'):
+            self.assertEqual(self.cli(name, 'stop').returncode, 0)
 
     def kill_worker_and_vm(self, name):
         # What `pkill -f "lampvm.*NAME"` did to request 29: worker and VM die together.
