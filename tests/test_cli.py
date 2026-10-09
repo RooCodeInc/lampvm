@@ -8,6 +8,7 @@ import contextlib
 import importlib.machinery
 import importlib.util
 import io
+import re
 import subprocess
 import json
 from pathlib import Path
@@ -233,7 +234,7 @@ class CaptureSafetyTests(IsolatedState, unittest.TestCase):
             self.fake_capture(*arguments, **kwargs)
         self.assertIsNone(vm.glide(argparse.Namespace(glide=False)))
         self.assertEqual(vm.glide(argparse.Namespace(glide=True)), "asked")
-        with mock.patch.object(vm, "need"), mock.patch.object(vm, "guest", side_effect=capture), \
+        with mock.patch.object(vm, "need"), mock.patch.object(vm, "guest", side_effect=capture), mock.patch.object(vm, "helper_version", return_value=1), \
              mock.patch.object(cli.subprocess, "run"), contextlib.redirect_stdout(io.StringIO()):
             vm.artifact(self.artifact_args(), True)
             vm.artifact(self.artifact_args())
@@ -255,6 +256,38 @@ class CaptureSafetyTests(IsolatedState, unittest.TestCase):
         helper.write_text('#!/bin/zsh\n[[ $1 == version ]] && { print 2; exit 0 }\nprint -r -- "$*"\n')
         self.assertEqual(run("recording").stdout, "move 1 2 --glide\n")
         self.assertEqual(run("asked").stdout, "move 1 2 --glide\n")
+
+    def test_recording_uses_the_helper_when_it_can_record_and_screencapture_when_not(self):
+        vm = self.vm()
+        vm.ctl = "/Users/admin/.local/bin/vmctl"
+        for version, expected in [(3, [vm.ctl, "record", "REMOTE", "--seconds", "1"]), (1, ["/usr/sbin/screencapture", "-x", "-v", "-V1", "-k", "REMOTE"])]:
+            def capture(*arguments, **kwargs):
+                self.fake_capture(*arguments, **kwargs)
+                return mock.Mock(stdout='{"file":"x","frames":3,"seconds":0.75}')
+            with mock.patch.object(vm, "need"), mock.patch.object(vm, "guest", side_effect=capture) as guest, \
+                 mock.patch.object(vm, "helper_version", return_value=version), mock.patch.object(cli.subprocess, "run"), contextlib.redirect_stdout(io.StringIO()):
+                vm.artifact(self.artifact_args(), True)
+            sent = [re.sub(r"/tmp/lampvm-[0-9a-f]+\.mov", "REMOTE", part) for part in guest.call_args_list[0].args]
+            self.assertEqual(sent, expected)
+
+    def test_stop_interrupts_only_lampvm_recordings_and_says_when_it_cannot(self):
+        vm = self.vm()
+        vm.ctl = "/Users/admin/.local/bin/vmctl"
+        self.assertTrue(re.search(cli.RECORDER, "/Users/admin/.local/bin/vmctl record /tmp/lampvm-0123abcd.mov --seconds 300"))
+        self.assertFalse(re.search(cli.RECORDER, "/Users/admin/.local/bin/vmctl record /Users/admin/own.mov"))
+        self.assertFalse(re.search(cli.RECORDER, "/usr/sbin/screencapture -x -v -V300 -k /tmp/lampvm-0123abcd.mov"))
+        with mock.patch.object(vm, "need"), mock.patch.object(vm, "helper_version", return_value=3), contextlib.redirect_stdout(io.StringIO()), \
+             mock.patch.object(cli.subprocess, "run", return_value=mock.Mock(returncode=0)) as run:
+            vm.stop_recording()
+        self.assertEqual(run.call_args.args[0][1:], ["exec", vm.name, "/usr/bin/pkill", "-INT", "-f", cli.RECORDER])
+        with mock.patch.object(vm, "need"), mock.patch.object(vm, "helper_version", return_value=3), \
+             mock.patch.object(cli.subprocess, "run", return_value=mock.Mock(returncode=1)):
+            with self.assertRaisesRegex(cli.Error, "No recording is running"):
+                vm.stop_recording()
+        with mock.patch.object(vm, "need"), mock.patch.object(vm, "helper_version", return_value=2), \
+             mock.patch.object(cli.subprocess, "run", return_value=mock.Mock(returncode=1)):
+            with self.assertRaisesRegex(cli.Error, "cannot end a recording early"):
+                vm.stop_recording()
 
     def test_partial_failed_copy_is_removed_and_guest_temp_is_cleaned(self):
         vm = self.vm()
