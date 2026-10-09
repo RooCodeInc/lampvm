@@ -39,7 +39,9 @@ let optionArguments: [String] = {
         "find":["--role"],"clickon":["--role","--index"],"press":["--role","--index"],"setvalue":["--role","--index"],
         "wait":["--role","--timeout"],"assert":["--role","--timeout"]]
     let boolFlags: [String:Set<String>] = [
-        "tree":["--json"],"find":["--json","--exact"],"clickon":["--exact","--right"],
+        "click":["--glide"],"doubleclick":["--glide"],"rightclick":["--glide"],"move":["--glide"],
+        "scroll":["--glide"],"drag":["--glide"],
+        "tree":["--json"],"find":["--json","--exact"],"clickon":["--exact","--right","--glide"],
         "setvalue":["--exact"],"press":["--exact"],"wait":["--exact","--absent"],"assert":["--exact","--absent"],
         "bounds":["--json"],"trusted":["--prompt"]]
     let options = Array(args.dropFirst(start)); var index = 0; var seen: Set<String> = []
@@ -68,15 +70,28 @@ func mouse(_ type: CGEventType, _ point: CGPoint, clicks: Int64 = 1, button: CGM
     guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: button) else { fail("cannot create mouse event") }
     event.setIntegerValueField(.mouseEventClickState, value: clicks); event.post(tap: .cghidEventTap); usleep(40_000)
 }
+// A recording shows the pointer travel to its target instead of appearing there.
+func glide(_ point: CGPoint) {
+    guard has("--glide"), let from = CGEvent(source: nil)?.location else { return }
+    let distance = hypot(point.x - from.x, point.y - from.y); guard distance > 4 else { return }
+    let seconds = min(0.6, max(0.2, distance / 1500)), steps = Int(seconds * 60)
+    for step in 1...steps {
+        let t = Double(step) / Double(steps), eased = t * t * (3 - 2 * t)
+        guard let event = CGEvent(mouseEventSource: source, mouseType: .mouseMoved,
+            mouseCursorPosition: CGPoint(x: from.x + (point.x - from.x) * eased, y: from.y + (point.y - from.y) * eased), mouseButton: .left) else { fail("cannot create mouse event") }
+        event.post(tap: .cghidEventTap); usleep(useconds_t(seconds / Double(steps) * 1_000_000))
+    }
+    usleep(150_000)
+}
 func click(_ point: CGPoint, count: Int = 1, right: Bool = false) {
-    mouse(.mouseMoved, point); usleep(120_000)
+    glide(point); mouse(.mouseMoved, point); usleep(120_000)
     for n in 1...count {
         mouse(right ? .rightMouseDown : .leftMouseDown, point, clicks: Int64(n), button: right ? .right : .left)
         mouse(right ? .rightMouseUp : .leftMouseUp, point, clicks: Int64(n), button: right ? .right : .left)
     }
 }
 func drag(_ start: CGPoint, _ end: CGPoint, seconds: Double) {
-    mouse(.mouseMoved, start); mouse(.leftMouseDown, start)
+    glide(start); mouse(.mouseMoved, start); mouse(.leftMouseDown, start)
     let steps = max(2, Int(seconds * 60))
     for step in 1...steps {
         let fraction = Double(step) / Double(steps)
@@ -88,7 +103,7 @@ func drag(_ start: CGPoint, _ end: CGPoint, seconds: Double) {
 }
 func scroll(_ point: CGPoint, dy: Int32, dx: Int32) {
     // Adapted from wheel.swift: short pixel-wheel events work with native scroll views.
-    mouse(.mouseMoved, point); usleep(80_000)
+    glide(point); mouse(.mouseMoved, point); usleep(80_000)
     var vertical = dy, horizontal = dx
     while vertical != 0 || horizontal != 0 {
         let y = max(-60, min(60, vertical)), x = max(-60, min(60, horizontal))
@@ -285,7 +300,7 @@ case "hit":
     if result["hit"] as? Bool != true { exit(1) }
 case "click","doubleclick","rightclick","move":
     require(3,"\(args[0]) X Y [--app APP]"); let point = CGPoint(x:number(1),y:number(2)); trusted(); activateConfigured()
-    if args[0] == "move" { mouse(.mouseMoved,point) } else { click(point,count:args[0] == "doubleclick" ? 2 : 1,right:args[0] == "rightclick") }
+    if args[0] == "move" { glide(point); mouse(.mouseMoved,point) } else { click(point,count:args[0] == "doubleclick" ? 2 : 1,right:args[0] == "rightclick") }
     json(["action":args[0],"x":point.x,"y":point.y,"eventPosted":true])
 case "drag":
     require(5,"drag X1 Y1 X2 Y2 [SECONDS] [--app APP]"); let start = CGPoint(x:number(1),y:number(2)), end = CGPoint(x:number(3),y:number(4)); let seconds = args.count > 5 && !args[5].hasPrefix("--") ? number(5) : 0.5

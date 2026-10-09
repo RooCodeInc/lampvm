@@ -223,6 +223,22 @@ class CaptureSafetyTests(IsolatedState, unittest.TestCase):
         self.assertEqual(len(set(captures)), 2)
         self.assertEqual(len(list((self.state / "artifacts").glob("*.png"))), 2)
 
+    def test_pointer_glides_only_while_a_recording_is_running_or_when_asked(self):
+        vm = self.vm()
+        seen = []
+        def capture(*arguments, **kwargs):
+            if arguments[0] == "/usr/sbin/screencapture":
+                seen.append(vm.glide(argparse.Namespace(glide=False)))
+            self.fake_capture(*arguments, **kwargs)
+        self.assertEqual(vm.glide(argparse.Namespace(glide=False)), [])
+        self.assertEqual(vm.glide(argparse.Namespace(glide=True)), ["--glide"])
+        with mock.patch.object(vm, "need"), mock.patch.object(vm, "guest", side_effect=capture), \
+             mock.patch.object(cli.subprocess, "run"), contextlib.redirect_stdout(io.StringIO()):
+            vm.artifact(self.artifact_args(), True)
+            vm.artifact(self.artifact_args())
+        self.assertEqual(seen, [["--glide"], []])
+        self.assertEqual(vm.glide(argparse.Namespace(glide=False)), [])
+
     def test_partial_failed_copy_is_removed_and_guest_temp_is_cleaned(self):
         vm = self.vm()
         destination = self.state / "failed.png"
