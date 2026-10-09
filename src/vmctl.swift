@@ -4,6 +4,8 @@ import AppKit
 import ApplicationServices
 import ImageIO
 import Vision
+import AVFoundation
+import ScreenCaptureKit
 
 func fail(_ message: String, code: Int32 = 1) -> Never {
     FileHandle.standardError.write(Data((message + "\n").utf8)); exit(code)
@@ -22,6 +24,79 @@ func pause(_ seconds: Double) {
     while deadline.timeIntervalSinceNow > 0.015 { usleep(1_000) }
     while deadline.timeIntervalSinceNow > 0 {}
 }
+// Records the main display with ScreenCaptureKit. A frame arrives only when the screen changes,
+// and the movie ends at the moment of stopping, so a still screen is kept at its real length.
+final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
+    let url: URL
+    let queue = DispatchQueue(label: "lampvm.record")
+    var stream: SCStream?, writer: AVAssetWriter?, input: AVAssetWriterInput?
+    var first = CMTime.invalid, frames = 0, latest: CMSampleBuffer?
+    init(url: URL) { self.url = url }
+    func start(region: CGRect?, started: @escaping () -> Void) {
+        SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, error in
+            guard let content, let display = content.displays.first(where: { $0.displayID == CGMainDisplayID() }) ?? content.displays.first else {
+                fail("cannot read the guest display; grant Screen Recording to vmctl (\(error?.localizedDescription ?? "no display"))")
+            }
+            let mode = CGDisplayCopyDisplayMode(display.displayID)
+            let scale = mode.map { Double($0.pixelWidth) / Double($0.width) } ?? 2
+            let area = region ?? CGRect(x: 0, y: 0, width: display.width, height: display.height)
+            let configuration = SCStreamConfiguration()
+            if region != nil { configuration.sourceRect = area }
+            // H.264 needs even dimensions.
+            configuration.width = Int(area.width * scale) / 2 * 2; configuration.height = Int(area.height * scale) / 2 * 2
+            configuration.minimumFrameInterval = CMTime(value: 1, timescale: 60)
+            configuration.showsCursor = true; configuration.queueDepth = 6
+            if #available(macOS 15.0, *) { configuration.showMouseClicks = true }
+            do {
+                let writer = try AVAssetWriter(outputURL: self.url, fileType: .mov)
+                let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+                    AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: configuration.width, AVVideoHeightKey: configuration.height,
+                    // Frames are written in the order shown, so players and ffmpeg see plain increasing times.
+                    AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: 10_000_000, AVVideoExpectedSourceFrameRateKey: 60, AVVideoAllowFrameReorderingKey: false]])
+                input.expectsMediaDataInRealTime = true; writer.add(input)
+                guard writer.startWriting() else { fail("cannot write \(self.url.path): \(writer.error?.localizedDescription ?? "unknown error")") }
+                self.writer = writer; self.input = input
+                let stream = SCStream(filter: SCContentFilter(display: display, excludingWindows: []), configuration: configuration, delegate: self)
+                try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: self.queue)
+                self.stream = stream
+                stream.startCapture { error in
+                    if let error { fail("recording did not start; grant Screen Recording to vmctl (\(error.localizedDescription))") }
+                    started()
+                }
+            } catch { fail("recording did not start: \(error.localizedDescription)") }
+        }
+    }
+    func stream(_ stream: SCStream, didOutputSampleBuffer sample: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .screen, sample.isValid, let writer, let input,
+              let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+              let status = attachments.first?[.status] as? Int, SCFrameStatus(rawValue: status) == .complete else { return }
+        if !first.isValid { first = sample.presentationTimeStamp; writer.startSession(atSourceTime: first) }
+        if input.isReadyForMoreMediaData, input.append(sample) { frames += 1; latest = sample }
+    }
+    func stream(_ stream: SCStream, didStopWithError error: Error) { fail("recording stopped: \(error.localizedDescription)") }
+    func finish(_ done: @escaping (Double, Int) -> Void) {
+        // Frame times are on the host clock, so the last frame is held until now.
+        let end = CMClockGetTime(CMClockGetHostTimeClock())
+        let close = {
+            self.queue.async {
+                guard let writer = self.writer, let input = self.input, self.first.isValid else { fail("no frame was captured; grant Screen Recording to vmctl") }
+                // A movie ends at its last frame, so show the last one again at the moment of stopping.
+                let again = CMTimeSubtract(end, CMTime(value: 1, timescale: 60))
+                if let latest = self.latest, CMTimeCompare(again, latest.presentationTimeStamp) > 0 {
+                    var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: again, decodeTimeStamp: .invalid), held: CMSampleBuffer?
+                    if CMSampleBufferCreateCopyWithNewTiming(allocator: nil, sampleBuffer: latest, sampleTimingEntryCount: 1, sampleTimingArray: &timing, sampleBufferOut: &held) == noErr,
+                       let held, input.isReadyForMoreMediaData { input.append(held) }
+                }
+                input.markAsFinished(); writer.endSession(atSourceTime: end)
+                writer.finishWriting {
+                    guard writer.status == .completed else { fail("cannot finish the movie: \(writer.error?.localizedDescription ?? "unknown error")") }
+                    done(CMTimeGetSeconds(CMTimeSubtract(end, self.first)), self.frames)
+                }
+            }
+        }
+        if let stream { stream.stopCapture { _ in close() } } else { close() }
+    }
+}
 func require(_ count: Int, _ usage: String) { if args.count < count { fail("usage: vmctl " + usage) } }
 func number(_ index: Int) -> Double {
     guard args.count > index, let value = Double(args[index]), value.isFinite, abs(value) <= 1_000_000 else { fail("expected finite number between -1000000 and 1000000 at argument \(index)") }
@@ -33,7 +108,7 @@ let optionArguments: [String] = {
     let command = args.first ?? ""
     let required = ["click":3,"doubleclick":3,"rightclick":3,"move":3,"hit":3,"scroll":4,"drag":5,
                     "type":2,"key":2,"activate":2,"quit":2,"tree":2,"find":3,"clickon":3,"press":3,
-                    "setvalue":4,"wait":3,"assert":3,"bounds":2,"windows":2,"ocr":2]
+                    "setvalue":4,"wait":3,"assert":3,"bounds":2,"windows":2,"ocr":2,"record":2]
     var start = required[command] ?? 1
     if let count = required[command], args.count < count { fail("not enough arguments for \(command); run vmctl without arguments for usage") }
     if ["scroll","drag","key"].contains(command), args.count > start, !args[start].hasPrefix("--") { start += 1 }
@@ -44,7 +119,7 @@ let optionArguments: [String] = {
         "click":["--app"],"doubleclick":["--app"],"rightclick":["--app"],"move":["--app"],
         "scroll":["--app"],"drag":["--app"],"type":["--app"],"key":["--app"],
         "find":["--role"],"clickon":["--role","--index"],"press":["--role","--index"],"setvalue":["--role","--index"],
-        "wait":["--role","--timeout"],"assert":["--role","--timeout"]]
+        "wait":["--role","--timeout"],"assert":["--role","--timeout"],"record":["--seconds","--region"]]
     let boolFlags: [String:Set<String>] = [
         "click":["--glide"],"doubleclick":["--glide"],"rightclick":["--glide"],"move":["--glide"],
         "scroll":["--glide"],"drag":["--glide"],
@@ -407,8 +482,32 @@ case "ocr": require(2,"ocr IMAGE_PATH"); recognize(args[1])
 case "trusted":
     let value = has("--prompt") ? AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String:true] as CFDictionary) : AXIsProcessTrusted()
     print(value ? "yes" : "no"); exit(value ? 0 : 1)
-// What this helper can do, for a host newer or older than it: 2 added --glide.
-case "version": print(2)
+case "record":
+    require(2,"record FILE [--seconds N] [--region X,Y,W,H]")
+    guard let limit = Double(option("--seconds") ?? "300"), limit >= 1, limit <= 300 else { fail("record duration must be 1…300 seconds") }
+    var region: CGRect?
+    if let text = option("--region") {
+        let parts = text.split(separator: ",").compactMap { Double($0) }
+        guard parts.count == 4, parts[2] > 0, parts[3] > 0 else { fail("--region needs X,Y,WIDTH,HEIGHT in screen points") }
+        region = CGRect(x: parts[0], y: parts[1], width: parts[2], height: parts[3])
+    }
+    let recorder = Recorder(url: URL(fileURLWithPath: args[1]))
+    var stopping = false
+    let stop = {
+        if stopping { return }; stopping = true
+        recorder.finish { seconds, frames in json(["file":args[1],"seconds":seconds,"frames":frames]); exit(0) }
+    }
+    // An interrupt or the time limit ends the take; either way the movie is closed before exiting.
+    var signals: [DispatchSourceSignal] = []
+    for number in [SIGINT, SIGTERM] {
+        signal(number, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
+        source.setEventHandler(handler: stop); source.resume(); signals.append(source)
+    }
+    recorder.start(region: region) { DispatchQueue.main.asyncAfter(deadline: .now() + limit, execute: stop) }
+    dispatchMain()
+// What this helper can do, for a host newer or older than it: 2 added --glide, 3 added record.
+case "version": print(3)
 default:
     fail("usage: vmctl click|doubleclick|rightclick X Y | move X Y | hit X Y | scroll X Y DY [DX] | drag X1 Y1 X2 Y2 [SECONDS] | type TEXT | key NAME [mods] | activate|quit APP | tree APP [--json] | find|clickon|press APP TEXT | wait|assert APP TEXT [--absent] [--timeout SEC] | setvalue APP TEXT VALUE | bounds|windows APP | apps | ocr IMAGE_PATH | trusted [--prompt] | display [WIDTH HEIGHT]")
 }

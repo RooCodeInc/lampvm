@@ -168,7 +168,7 @@ $L shot /tmp/test-ready.png --app Test
 $L record /tmp/test-flow.mov --seconds 5 --app Test
 ```
 
-`record` blocks until its `--seconds` run out, then copies the movie to the host. Start it in the background and drive the app while it runs. A recording cannot be ended early: the guest's `screencapture` discards the movie when interrupted.
+`record` blocks until `record --stop` ends it or its `--seconds` run out, then copies the movie to the host and reports how long the take ran. Start it in the background, drive the app, then stop it. The guest helper records the display itself with ScreenCaptureKit and closes the movie when stopped, so the movie ends at the moment of stopping. It needs Screen Recording for the helper, which `setup` already grants along with Accessibility by writing the guest's permission database (possible because the test image has SIP disabled); nothing new is granted.
 
 ### Recording a video for a pull request
 
@@ -177,20 +177,22 @@ A viewer sees every second the screen stands still, so the whole take is one scr
 1. Rehearse first without recording: find each label with `tree`/`find`, run every step once and settle the script. Reset the app to its starting state afterwards.
 2. Run the script below in one shell call. Do not issue the steps as separate tool calls: the time you spend reading output between them is a frozen screen in the video.
 3. Wait on what the app shows (`wait APP TEXT`, `wait ... --absent`), never `sleep`. `wait` returns the moment the text is there. Keep a `sleep` of a second or less only where the viewer needs to read a result.
-4. Time the rehearsal and give `record` that many seconds plus two or three, so the take ends just after the last result and nothing has to be cut out. If the app's own wait varies (a build, a model reply), record that step as its own take.
+4. End with `record --stop` as soon as the last result is on screen. `--seconds` is only the upper limit (300 at most), so a take is never sized in advance and nothing has to be cut out afterwards.
 
 ```sh
-$L record /tmp/flow.mov --seconds 20 &       # the rehearsal took 17 s
+$L record /tmp/flow.mov --seconds 300 &      # upper limit; stopped below
 $L wait Test 'Continue' --exact --timeout 10  # also gives the recording time to start
 $L clickon Test 'Continue' --exact
 $L clickon Test 'Name' --exact
 $L type 'made-up input'
 $L key return
 $L wait Test 'Ready' --exact --timeout 60     # however long the app takes, and no longer
+sleep 1                                       # let the viewer read the result
+$L record --stop
 wait                                          # the record call saves /tmp/flow.mov
 ```
 
-While a recording of the VM is running, `move`, `click`, `doubleclick`, `rightclick`, `drag`, `scroll` and `clickon` carry the pointer to the target in 0.12–0.35 seconds instead of jumping there; `--glide` on any of them does the same without a recording. A VM whose guest helper predates the glide (`vmctl version` fails or reports less than 2) is driven without it during a recording, and `--glide` there is an error; clones of a clean image prepared by the current `setup` have it. Prefer `clickon` with a label to `move` then `click` with coordinates: it is one step on screen instead of two. If the app itself makes the viewer wait (a build, a model reply), say so in the pull request rather than cutting the video.
+While a recording of the VM is running, `move`, `click`, `doubleclick`, `rightclick`, `drag`, `scroll` and `clickon` carry the pointer to the target in 0.12–0.35 seconds instead of jumping there; `--glide` on any of them does the same without a recording. A VM keeps the guest helper it was prepared with. One whose helper predates the glide (`vmctl version` fails or reports less than 2) is driven without it during a recording, and `--glide` there is an error. One whose helper predates the recorder (less than 3) records with the guest's `screencapture` as before: the take runs for its full `--seconds` and `record --stop` is an error. Clones of a clean image prepared by the current `setup` have both. Prefer `clickon` with a label to `move` then `click` with coordinates: it is one step on screen instead of two. If the app itself makes the viewer wait (a build, a model reply), say so in the pull request rather than cutting the video.
 
 Cropping uses the app window, not guessed screenshot coordinates. Screenshots use a unique guest temporary filename on every call; omitting the host destination also gives a unique output name. Concurrent captures do not overwrite each other's temporary files, but concurrent UI interactions still require separate VMs.
 
@@ -237,7 +239,7 @@ Global selection: `--name NAME`, `--config FILE`, `--state-dir DIRECTORY`. Envir
 | `wait [APP] TEXT [--timeout SEC]` | Polls for an element; `--absent` waits for removal, `--exact` and `--role ROLE` restrict matching. A timeout exits unsuccessfully. |
 | `assert [APP] TEXT` | Immediately checks presence; `--absent` checks absence and `--exact` and `--role ROLE` restrict matching. Failure exits unsuccessfully. |
 | `shot [FILE] [--app APP]` | Captures the desktop, or activates/crops to the selected/configured app window, and copies the PNG to the host. |
-| `record [FILE] [--seconds N] [--app APP]` | Records N seconds (1–300, default 5) on the guest and copies the movie to the host; optional selected/configured app-window crop. |
+| `record [FILE] [--seconds N] [--app APP]` | Records the guest display, or the selected/configured app's window area, for up to N seconds (1–300, default 5) and copies the movie to the host. `record --stop` ends the VM's running recordings now; each waiting `record` call then saves its movie. |
 | `exec COMMAND [ARGS…]` | Runs an executable as the guest's logged-in user. |
 | `sh` | Runs stdin as a guest zsh script. |
 | `push SOURCE DEST` | Streams a host file/folder into a guest directory. |
