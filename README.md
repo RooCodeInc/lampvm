@@ -168,7 +168,31 @@ $L shot /tmp/test-ready.png --app Test
 $L record /tmp/test-flow.mov --seconds 5 --app Test
 ```
 
-Recording blocks until it finishes; start it in a separate shell/background process to capture input commands. While a recording of the VM is running, `move`, `click`, `doubleclick`, `rightclick`, `drag`, `scroll` and `clickon` carry the pointer to the target in 0.12–0.35 seconds instead of jumping there; `--glide` on any of them does the same without a recording. Run the whole flow from one script: every pause between commands is a frozen stretch in the video. Cropping uses the app window, not guessed screenshot coordinates. Screenshots use a unique guest temporary filename on every call; omitting the host destination also gives a unique output name. Concurrent captures do not overwrite each other's temporary files, but concurrent UI interactions still require separate VMs.
+`record` blocks until its `--seconds` run out, then copies the movie to the host. Start it in the background and drive the app while it runs. A recording cannot be ended early: the guest's `screencapture` discards the movie when interrupted.
+
+### Recording a video for a pull request
+
+A viewer sees every second the screen stands still, so the whole take is one script, written and tried before recording:
+
+1. Rehearse first without recording: find each label with `tree`/`find`, run every step once and settle the script. Reset the app to its starting state afterwards.
+2. Run the script below in one shell call. Do not issue the steps as separate tool calls: the time you spend reading output between them is a frozen screen in the video.
+3. Wait on what the app shows (`wait APP TEXT`, `wait ... --absent`), never `sleep`. `wait` returns the moment the text is there. Keep a `sleep` of a second or less only where the viewer needs to read a result.
+4. Time the rehearsal and give `record` that many seconds plus two or three, so the take ends just after the last result and nothing has to be cut out. If the app's own wait varies (a build, a model reply), record that step as its own take.
+
+```sh
+$L record /tmp/flow.mov --seconds 20 &       # the rehearsal took 17 s
+$L wait Test 'Continue' --exact --timeout 10  # also gives the recording time to start
+$L clickon Test 'Continue' --exact
+$L clickon Test 'Name' --exact
+$L type 'made-up input'
+$L key return
+$L wait Test 'Ready' --exact --timeout 60     # however long the app takes, and no longer
+wait                                          # the record call saves /tmp/flow.mov
+```
+
+While a recording of the VM is running, `move`, `click`, `doubleclick`, `rightclick`, `drag`, `scroll` and `clickon` carry the pointer to the target in 0.12–0.35 seconds instead of jumping there; `--glide` on any of them does the same without a recording. Prefer `clickon` with a label to `move` then `click` with coordinates: it is one step on screen instead of two. If the app itself makes the viewer wait (a build, a model reply), say so in the pull request rather than cutting the video.
+
+Cropping uses the app window, not guessed screenshot coordinates. Screenshots use a unique guest temporary filename on every call; omitting the host destination also gives a unique output name. Concurrent captures do not overwrite each other's temporary files, but concurrent UI interactions still require separate VMs.
 
 Coordinates use screen points with the origin at the top left. They are not screenshot pixels: Retina screenshots may have twice as many pixels. Read `tree`, `find` or `bounds` before clicking. Prefer exact labels and verify observable state afterwards. A successful click hit report confirms the target was under the pointer; it cannot prove the app completed its action.
 
@@ -213,7 +237,7 @@ Global selection: `--name NAME`, `--config FILE`, `--state-dir DIRECTORY`. Envir
 | `wait [APP] TEXT [--timeout SEC]` | Polls for an element; `--absent` waits for removal, `--exact` and `--role ROLE` restrict matching. A timeout exits unsuccessfully. |
 | `assert [APP] TEXT` | Immediately checks presence; `--absent` checks absence and `--exact` and `--role ROLE` restrict matching. Failure exits unsuccessfully. |
 | `shot [FILE] [--app APP]` | Captures the desktop, or activates/crops to the selected/configured app window, and copies the PNG to the host. |
-| `record [FILE] [--seconds N] [--app APP]` | Records 1–300 seconds (default 5) on the guest and copies the movie to the host; optional selected/configured app-window crop. |
+| `record [FILE] [--seconds N] [--app APP]` | Records N seconds (1–300, default 5) on the guest and copies the movie to the host; optional selected/configured app-window crop. |
 | `exec COMMAND [ARGS…]` | Runs an executable as the guest's logged-in user. |
 | `sh` | Runs stdin as a guest zsh script. |
 | `push SOURCE DEST` | Streams a host file/folder into a guest directory. |
