@@ -161,20 +161,25 @@ class VM:
             reports = set(self.gout("/bin/zsh", "-c", source).splitlines())
             if reports - set(record["panic_reports"]):
                 issues.append("guest has new kernel panic reports; inspect its DiagnosticReports before testing")
-        reporter = subprocess.run([str(self.tart), "exec", self.name, self.ctl, "tree", "Diagnostics Reporter"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=15)
+        reporter = subprocess.run([str(self.tart), "exec", self.name, self.helper(), "tree", "Diagnostics Reporter"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=15)
         if "restarted" in reporter.stdout.lower() and "problem" in reporter.stdout.lower():
             issues.append("guest displays a restart error; inspect it before testing")
-        assistant = subprocess.run([str(self.tart), "exec", self.name, self.ctl, "windows", "com.apple.SetupAssistant"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=15)
+        assistant = subprocess.run([str(self.tart), "exec", self.name, self.helper(), "windows", "com.apple.SetupAssistant"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=15)
         if assistant.returncode == 0 and json.loads(assistant.stdout):
             issues.append("Setup Assistant is still open; complete setup before testing")
         return issues
 
-    def control(self, *args, capture=False):
+    def helper(self):
         if self.ctl is None:
             self.ctl = self.gout("/bin/zsh", "-c", 'print -r -- "$HOME/.local/bin/vmctl"')
             if not self.ctl.startswith("/"):
                 raise Error("Guest did not report an absolute vmctl path")
-        return self.gout(self.ctl, *args) if capture else self.guest(self.ctl, *args)
+        return self.ctl
+
+    def control(self, *args, capture=False):
+        # One guest call per command: asking for the helper's path first doubles the wait.
+        command = [self.ctl] if self.ctl else ["/bin/zsh", "-c", 'exec "$HOME/.local/bin/vmctl" "$@"', "vmctl"]
+        return self.gout(*command, *args) if capture else self.guest(*command, *args)
 
     def recording(self):
         (self.state / "locks").mkdir(parents=True, exist_ok=True)
@@ -316,7 +321,7 @@ class VM:
                 ready = None
             if ready and ready.returncode == 0:
                 self.control("trusted", capture=True)
-                complete_desktop(self.tart, self.name, self.ctl)
+                complete_desktop(self.tart, self.name, self.helper())
                 issues = self.health()
                 if issues:
                     raise Error("; ".join(issues) + "; the owned VM remains running for inspection")
@@ -793,10 +798,10 @@ mv -- "$staging/new/$1" /Applications/
                     allowed = {"click": (2,), "doubleclick": (2,), "rightclick": (2,), "move": (2,), "hit": (2,), "scroll": (3, 4), "drag": (4, 5)}[cmd]
                     if len(args.values) not in allowed or not all(math.isfinite(v) and abs(v) <= 1_000_000 for v in args.values):
                         raise Error("Wrong number of coordinates or numeric value outside +/-1000000")
-                if vm.app and cmd != "hit":
-                    vm.control("activate", vm.app)
                 values = [args.text] if cmd == "type" else ([args.key] + ([args.modifiers] if args.modifiers else [])) if cmd == "key" else [str(x) for x in args.values]
-                vm.control(cmd, *values, *(vm.glide(args) if hasattr(args, "values") and cmd != "hit" else []))
+                # The helper brings the app forward itself, saving a guest call per action.
+                options = ["--app", vm.app] if vm.app and cmd != "hit" else []
+                vm.control(cmd, *values, *options, *(vm.glide(args) if hasattr(args, "values") and cmd != "hit" else []))
             elif cmd == "exec":
                 if not args.args:
                     raise Error("exec needs a command")
