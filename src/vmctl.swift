@@ -15,6 +15,13 @@ func json(_ value: Any) {
 }
 let args = Array(CommandLine.arguments.dropFirst())
 let source = CGEventSource(stateID: .hidSystemState)
+// Short sleeps in the guest overrun by 10–30 ms each, which made typing and drags several times slower than asked.
+// Sleep in small pieces short of the deadline, then wait out the rest.
+func pause(_ seconds: Double) {
+    let deadline = Date().addingTimeInterval(seconds)
+    while deadline.timeIntervalSinceNow > 0.015 { usleep(1_000) }
+    while deadline.timeIntervalSinceNow > 0 {}
+}
 func require(_ count: Int, _ usage: String) { if args.count < count { fail("usage: vmctl " + usage) } }
 func number(_ index: Int) -> Double {
     guard args.count > index, let value = Double(args[index]), value.isFinite, abs(value) <= 1_000_000 else { fail("expected finite number between -1000000 and 1000000 at argument \(index)") }
@@ -39,7 +46,9 @@ let optionArguments: [String] = {
         "find":["--role"],"clickon":["--role","--index"],"press":["--role","--index"],"setvalue":["--role","--index"],
         "wait":["--role","--timeout"],"assert":["--role","--timeout"]]
     let boolFlags: [String:Set<String>] = [
-        "tree":["--json"],"find":["--json","--exact"],"clickon":["--exact","--right"],
+        "click":["--glide"],"doubleclick":["--glide"],"rightclick":["--glide"],"move":["--glide"],
+        "scroll":["--glide"],"drag":["--glide"],
+        "tree":["--json"],"find":["--json","--exact"],"clickon":["--exact","--right","--glide"],
         "setvalue":["--exact"],"press":["--exact"],"wait":["--exact","--absent"],"assert":["--exact","--absent"],
         "bounds":["--json"],"trusted":["--prompt"]]
     let options = Array(args.dropFirst(start)); var index = 0; var seen: Set<String> = []
@@ -66,34 +75,44 @@ func timeout() -> Double {
 func trusted() { guard AXIsProcessTrusted() else { fail("Accessibility is not granted to vmctl in the guest; run lampvm setup or grant it in Privacy & Security") } }
 func mouse(_ type: CGEventType, _ point: CGPoint, clicks: Int64 = 1, button: CGMouseButton = .left) {
     guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: button) else { fail("cannot create mouse event") }
-    event.setIntegerValueField(.mouseEventClickState, value: clicks); event.post(tap: .cghidEventTap); usleep(40_000)
+    event.setIntegerValueField(.mouseEventClickState, value: clicks); event.post(tap: .cghidEventTap); pause(0.04)
+}
+// A recording shows the pointer travel to its target instead of appearing there.
+// Position follows the clock, so a motion takes the time asked even when the guest sleeps longer than requested.
+func travel(_ type: CGEventType, _ from: CGPoint, _ to: CGPoint, seconds: Double, eased: Bool = false) {
+    let begun = Date()
+    while true {
+        let t = min(1, Date().timeIntervalSince(begun) / seconds), fraction = eased ? t * t * (3 - 2 * t) : t
+        guard let event = CGEvent(mouseEventSource: source, mouseType: type,
+            mouseCursorPosition: CGPoint(x: from.x + (to.x - from.x) * fraction, y: from.y + (to.y - from.y) * fraction), mouseButton: .left) else { fail("cannot create mouse event") }
+        event.post(tap: .cghidEventTap); if t >= 1 { break }; pause(0.008)
+    }
+}
+func glide(_ point: CGPoint) {
+    guard has("--glide"), let from = CGEvent(source: nil)?.location else { return }
+    let distance = hypot(point.x - from.x, point.y - from.y); guard distance > 4 else { return }
+    travel(.mouseMoved, from, point, seconds: min(0.35, max(0.12, distance / 2500)), eased: true); pause(0.06)
 }
 func click(_ point: CGPoint, count: Int = 1, right: Bool = false) {
-    mouse(.mouseMoved, point); usleep(120_000)
+    glide(point); mouse(.mouseMoved, point); pause(0.12)
     for n in 1...count {
         mouse(right ? .rightMouseDown : .leftMouseDown, point, clicks: Int64(n), button: right ? .right : .left)
         mouse(right ? .rightMouseUp : .leftMouseUp, point, clicks: Int64(n), button: right ? .right : .left)
     }
 }
 func drag(_ start: CGPoint, _ end: CGPoint, seconds: Double) {
-    mouse(.mouseMoved, start); mouse(.leftMouseDown, start)
-    let steps = max(2, Int(seconds * 60))
-    for step in 1...steps {
-        let fraction = Double(step) / Double(steps)
-        guard let event = CGEvent(mouseEventSource: source, mouseType: .leftMouseDragged,
-            mouseCursorPosition: CGPoint(x: start.x + (end.x - start.x) * fraction, y: start.y + (end.y - start.y) * fraction), mouseButton: .left) else { fail("cannot create drag event") }
-        event.post(tap: .cghidEventTap); usleep(useconds_t(seconds / Double(steps) * 1_000_000))
-    }
+    glide(start); mouse(.mouseMoved, start); mouse(.leftMouseDown, start)
+    travel(.leftMouseDragged, start, end, seconds: seconds)
     mouse(.leftMouseUp, end)
 }
 func scroll(_ point: CGPoint, dy: Int32, dx: Int32) {
     // Adapted from wheel.swift: short pixel-wheel events work with native scroll views.
-    mouse(.mouseMoved, point); usleep(80_000)
+    glide(point); mouse(.mouseMoved, point); pause(0.08)
     var vertical = dy, horizontal = dx
     while vertical != 0 || horizontal != 0 {
         let y = max(-60, min(60, vertical)), x = max(-60, min(60, horizontal))
         guard let event = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2, wheel1: y, wheel2: x, wheel3: 0) else { fail("cannot create scroll event") }
-        event.post(tap: .cghidEventTap); vertical -= y; horizontal -= x; usleep(8_000)
+        event.post(tap: .cghidEventTap); vertical -= y; horizontal -= x; pause(0.008)
     }
 }
 let keyCodes: [String: CGKeyCode] = [
@@ -116,7 +135,7 @@ func flags(_ names: String) -> CGEventFlags {
 func key(_ code: CGKeyCode, _ modifiers: CGEventFlags = []) {
     for down in [true,false] {
         guard let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down) else { fail("cannot create key event") }
-        event.flags = modifiers; event.post(tap: .cghidEventTap); usleep(15_000)
+        event.flags = modifiers; event.post(tap: .cghidEventTap); pause(0.015)
     }
 }
 func type(_ text: String) {
@@ -126,7 +145,7 @@ func type(_ text: String) {
         for down in [true,false] {
             guard let event = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: down) else { fail("cannot create key event") }
             event.flags = []; event.keyboardSetUnicodeString(stringLength: units.count, unicodeString: units)
-            event.post(tap: .cghidEventTap); usleep(12_000)
+            event.post(tap: .cghidEventTap); pause(0.012)
         }
     }
 }
@@ -215,7 +234,7 @@ func activate(_ application: NSRunningApplication) {
         RunLoop.current.run(until:Date().addingTimeInterval(0.05))
     }
     guard NSWorkspace.shared.frontmostApplication?.processIdentifier == application.processIdentifier else { fail("app did not become frontmost") }
-    usleep(150_000)
+    pause(0.15)
 }
 func activateConfigured() { if let name = option("--app") { activate(app(name)) } }
 func hit(_ point: CGPoint) -> AXUIElement? {
@@ -285,7 +304,7 @@ case "hit":
     if result["hit"] as? Bool != true { exit(1) }
 case "click","doubleclick","rightclick","move":
     require(3,"\(args[0]) X Y [--app APP]"); let point = CGPoint(x:number(1),y:number(2)); trusted(); activateConfigured()
-    if args[0] == "move" { mouse(.mouseMoved,point) } else { click(point,count:args[0] == "doubleclick" ? 2 : 1,right:args[0] == "rightclick") }
+    if args[0] == "move" { glide(point); mouse(.mouseMoved,point) } else { click(point,count:args[0] == "doubleclick" ? 2 : 1,right:args[0] == "rightclick") }
     json(["action":args[0],"x":point.x,"y":point.y,"eventPosted":true])
 case "drag":
     require(5,"drag X1 Y1 X2 Y2 [SECONDS] [--app APP]"); let start = CGPoint(x:number(1),y:number(2)), end = CGPoint(x:number(3),y:number(4)); let seconds = args.count > 5 && !args[5].hasPrefix("--") ? number(5) : 0.5
@@ -337,7 +356,7 @@ case "find","clickon","press","setvalue":
         let f = item.rect!, point = CGPoint(x:f.midX,y:f.midY), before = hit(point)
         let landed = before.map { pid($0) == application.processIdentifier && descends($0,from:item.element) } ?? false
         guard landed else { json(["landed":false,"eventPosted":false,"reason":"hit-test did not identify the target or its descendant","target":item.object,"hitPID":pid(before) ?? -1,"hit":hitDiagnostics(before)]); exit(1) }
-        click(point,right:has("--right")); usleep(100_000)
+        click(point,right:has("--right")); pause(0.1)
         json(["landed":true,"eventPosted":true,"verification":"pre-click Accessibility hit-test matched target or descendant; semantic result requires a subsequent assertion","target":item.object,"postClickHitPID":pid(hit(point)) ?? -1])
     }
 case "wait","assert":
@@ -347,7 +366,7 @@ case "wait","assert":
     repeat {
         found = running(args[1]).map { matches(elements($0),args[2]) } ?? []
         if found.isEmpty == absent { json(["ok":true,"absent":absent,"matches":found.count,"text":args[2]]); exit(0) }
-        if Date() >= deadline { break }; usleep(100_000)
+        if Date() >= deadline { break }; pause(0.1)
     } while true
     json(["ok":false,"absent":absent,"matches":found.count,"text":args[2],"timeout":duration]); exit(1)
 case "bounds","windows":
@@ -388,6 +407,8 @@ case "ocr": require(2,"ocr IMAGE_PATH"); recognize(args[1])
 case "trusted":
     let value = has("--prompt") ? AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String:true] as CFDictionary) : AXIsProcessTrusted()
     print(value ? "yes" : "no"); exit(value ? 0 : 1)
+// What this helper can do, for a host newer or older than it: 2 added --glide.
+case "version": print(2)
 default:
     fail("usage: vmctl click|doubleclick|rightclick X Y | move X Y | hit X Y | scroll X Y DY [DX] | drag X1 Y1 X2 Y2 [SECONDS] | type TEXT | key NAME [mods] | activate|quit APP | tree APP [--json] | find|clickon|press APP TEXT | wait|assert APP TEXT [--absent] [--timeout SEC] | setvalue APP TEXT VALUE | bounds|windows APP | apps | ocr IMAGE_PATH | trusted [--prompt] | display [WIDTH HEIGHT]")
 }

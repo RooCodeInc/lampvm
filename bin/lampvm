@@ -2,6 +2,7 @@
 """A shell interface to an isolated macOS desktop. No host GUI automation."""
 import argparse
 import contextlib
+import fcntl
 import json
 import math
 import os
@@ -42,6 +43,16 @@ def reachable(host, port):
             return True
     except OSError:
         return False
+
+
+# A VM made before the helper could glide keeps its helper for life. Its helper answers `version`
+# with a failure, so a recording there is driven as before instead of failing on an option it lacks.
+GLIDING = r'''helper="$HOME/.local/bin/vmctl"; why=$1; shift
+version=$("$helper" version 2>/dev/null) || version=1
+if [[ $version == <-> && $version -ge 2 ]]; then exec "$helper" "$@" --glide; fi
+if [[ $why == asked ]]; then print -u2 "This VM's guest helper is older than --glide. Clone a VM from a clean image prepared with the current helper."; exit 2; fi
+exec "$helper" "$@"'''
+GLIDE = "move the pointer to the target smoothly; always on while this VM is being recorded"
 
 
 def valid_name(name):
@@ -157,20 +168,40 @@ class VM:
             reports = set(self.gout("/bin/zsh", "-c", source).splitlines())
             if reports - set(record["panic_reports"]):
                 issues.append("guest has new kernel panic reports; inspect its DiagnosticReports before testing")
-        reporter = subprocess.run([str(self.tart), "exec", self.name, self.ctl, "tree", "Diagnostics Reporter"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=15)
+        reporter = subprocess.run([str(self.tart), "exec", self.name, self.helper(), "tree", "Diagnostics Reporter"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=15)
         if "restarted" in reporter.stdout.lower() and "problem" in reporter.stdout.lower():
             issues.append("guest displays a restart error; inspect it before testing")
-        assistant = subprocess.run([str(self.tart), "exec", self.name, self.ctl, "windows", "com.apple.SetupAssistant"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=15)
+        assistant = subprocess.run([str(self.tart), "exec", self.name, self.helper(), "windows", "com.apple.SetupAssistant"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=15)
         if assistant.returncode == 0 and json.loads(assistant.stdout):
             issues.append("Setup Assistant is still open; complete setup before testing")
         return issues
 
-    def control(self, *args, capture=False):
+    def helper(self):
         if self.ctl is None:
             self.ctl = self.gout("/bin/zsh", "-c", 'print -r -- "$HOME/.local/bin/vmctl"')
             if not self.ctl.startswith("/"):
                 raise Error("Guest did not report an absolute vmctl path")
-        return self.gout(self.ctl, *args) if capture else self.guest(self.ctl, *args)
+        return self.ctl
+
+    def control(self, *args, capture=False, glide=None):
+        # One guest call per command: asking for the helper's path first doubles the wait.
+        if glide:
+            return self.guest("/bin/zsh", "-c", GLIDING, "vmctl", glide, *args)
+        command = [self.ctl] if self.ctl else ["/bin/zsh", "-c", 'exec "$HOME/.local/bin/vmctl" "$@"', "vmctl"]
+        return self.gout(*command, *args) if capture else self.guest(*command, *args)
+
+    def recording(self):
+        (self.state / "locks").mkdir(parents=True, exist_ok=True)
+        return self.state / "locks" / (self.name + "-recording.lock")
+
+    def glide(self, args):
+        # A pointer that jumps is unreadable in a video; outside one the jump is faster.
+        if getattr(args, "glide", False):
+            return "asked"
+        handle = flock_file(self.recording())
+        if handle:
+            handle.close()
+        return None if handle else "recording"
 
     def application(self, explicit=None):
         app = explicit or self.app
@@ -299,7 +330,7 @@ class VM:
                 ready = None
             if ready and ready.returncode == 0:
                 self.control("trusted", capture=True)
-                complete_desktop(self.tart, self.name, self.ctl)
+                complete_desktop(self.tart, self.name, self.helper())
                 issues = self.health()
                 if issues:
                     raise Error("; ".join(issues) + "; the owned VM remains running for inspection")
@@ -388,7 +419,11 @@ class VM:
             command += ["-v", "-V" + str(args.seconds), "-k"]
         partial = destination.with_name(destination.name + "." + ident + ".partial")
         try:
-            self.guest(*command, remote)
+            # Held for the length of the capture so pointer commands know to glide.
+            with self.recording().open("a") if video else contextlib.nullcontext() as marker:
+                if video:  # Shared: two recordings of one VM may overlap.
+                    fcntl.flock(marker, fcntl.LOCK_SH)
+                self.guest(*command, remote)
             with partial.open("xb") as stream:
                 self.guest("/bin/cat", remote, stdout=stream)
             if partial.stat().st_size == 0:
@@ -504,10 +539,13 @@ def parser():
             q.add_argument("--index", type=int)
         if name == "clickon":
             q.add_argument("--right", action="store_true")
+            q.add_argument("--glide", action="store_true", help=GLIDE)
     for name, count in [("click", 2), ("doubleclick", 2), ("rightclick", 2), ("move", 2), ("hit", 2), ("scroll", 3), ("drag", 4)]:
         q = add(name, "inspect the accessible element under a point" if name == "hit" else "send real guest mouse events")
         q.add_argument("values", nargs="+", type=float)
         app_option(q)
+        if name != "hit":
+            q.add_argument("--glide", action="store_true", help=GLIDE)
     q = add("type", "type Unicode into the focused control")
     q.add_argument("text")
     app_option(q)
@@ -761,16 +799,18 @@ mv -- "$staging/new/$1" /Applications/
                     if not math.isfinite(args.timeout) or not 0 <= args.timeout <= 3600:
                         raise Error("Timeout must be 0..3600 seconds")
                     argv += ["--timeout", str(args.timeout)]
-                vm.control(*argv)
+                glide = vm.glide(args) if cmd == "clickon" else None
+                vm.control(*argv, **({"glide": glide} if glide else {}))
             elif cmd in ["click", "doubleclick", "rightclick", "move", "hit", "scroll", "drag", "type", "key"]:
                 if hasattr(args, "values"):
                     allowed = {"click": (2,), "doubleclick": (2,), "rightclick": (2,), "move": (2,), "hit": (2,), "scroll": (3, 4), "drag": (4, 5)}[cmd]
                     if len(args.values) not in allowed or not all(math.isfinite(v) and abs(v) <= 1_000_000 for v in args.values):
                         raise Error("Wrong number of coordinates or numeric value outside +/-1000000")
-                if vm.app and cmd != "hit":
-                    vm.control("activate", vm.app)
                 values = [args.text] if cmd == "type" else ([args.key] + ([args.modifiers] if args.modifiers else [])) if cmd == "key" else [str(x) for x in args.values]
-                vm.control(cmd, *values)
+                # The helper brings the app forward itself, saving a guest call per action.
+                options = ["--app", vm.app] if vm.app and cmd != "hit" else []
+                glide = vm.glide(args) if hasattr(args, "values") and cmd != "hit" else None
+                vm.control(cmd, *values, *options, **({"glide": glide} if glide else {}))
             elif cmd == "exec":
                 if not args.args:
                     raise Error("exec needs a command")
