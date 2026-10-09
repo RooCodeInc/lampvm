@@ -190,7 +190,7 @@ $L wait Test 'Ready' --exact --timeout 60     # however long the app takes, and 
 wait                                          # the record call saves /tmp/flow.mov
 ```
 
-While a recording of the VM is running, `move`, `click`, `doubleclick`, `rightclick`, `drag`, `scroll` and `clickon` carry the pointer to the target in 0.12–0.35 seconds instead of jumping there; `--glide` on any of them does the same without a recording. Prefer `clickon` with a label to `move` then `click` with coordinates: it is one step on screen instead of two. If the app itself makes the viewer wait (a build, a model reply), say so in the pull request rather than cutting the video.
+While a recording of the VM is running, `move`, `click`, `doubleclick`, `rightclick`, `drag`, `scroll` and `clickon` carry the pointer to the target in 0.12–0.35 seconds instead of jumping there; `--glide` on any of them does the same without a recording. A VM whose guest helper predates the glide (`vmctl version` fails or reports less than 2) is driven without it during a recording, and `--glide` there is an error; clones of a clean image prepared by the current `setup` have it. Prefer `clickon` with a label to `move` then `click` with coordinates: it is one step on screen instead of two. If the app itself makes the viewer wait (a build, a model reply), say so in the pull request rather than cutting the video.
 
 Cropping uses the app window, not guessed screenshot coordinates. Screenshots use a unique guest temporary filename on every call; omitting the host destination also gives a unique output name. Concurrent captures do not overwrite each other's temporary files, but concurrent UI interactions still require separate VMs.
 

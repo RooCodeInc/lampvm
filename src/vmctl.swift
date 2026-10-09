@@ -407,6 +407,8 @@ case "ocr": require(2,"ocr IMAGE_PATH"); recognize(args[1])
 case "trusted":
     let value = has("--prompt") ? AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String:true] as CFDictionary) : AXIsProcessTrusted()
     print(value ? "yes" : "no"); exit(value ? 0 : 1)
+// What this helper can do, for a host newer or older than it: 2 added --glide.
+case "version": print(2)
 default:
     fail("usage: vmctl click|doubleclick|rightclick X Y | move X Y | hit X Y | scroll X Y DY [DX] | drag X1 Y1 X2 Y2 [SECONDS] | type TEXT | key NAME [mods] | activate|quit APP | tree APP [--json] | find|clickon|press APP TEXT | wait|assert APP TEXT [--absent] [--timeout SEC] | setvalue APP TEXT VALUE | bounds|windows APP | apps | ocr IMAGE_PATH | trusted [--prompt] | display [WIDTH HEIGHT]")
 }

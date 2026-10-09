@@ -45,6 +45,13 @@ def reachable(host, port):
         return False
 
 
+# A VM made before the helper could glide keeps its helper for life. Its helper answers `version`
+# with a failure, so a recording there is driven as before instead of failing on an option it lacks.
+GLIDING = r'''helper="$HOME/.local/bin/vmctl"; why=$1; shift
+version=$("$helper" version 2>/dev/null) || version=1
+if [[ $version == <-> && $version -ge 2 ]]; then exec "$helper" "$@" --glide; fi
+if [[ $why == asked ]]; then print -u2 "This VM's guest helper is older than --glide. Clone a VM from a clean image prepared with the current helper."; exit 2; fi
+exec "$helper" "$@"'''
 GLIDE = "move the pointer to the target smoothly; always on while this VM is being recorded"
 
 
@@ -176,8 +183,10 @@ class VM:
                 raise Error("Guest did not report an absolute vmctl path")
         return self.ctl
 
-    def control(self, *args, capture=False):
+    def control(self, *args, capture=False, glide=None):
         # One guest call per command: asking for the helper's path first doubles the wait.
+        if glide:
+            return self.guest("/bin/zsh", "-c", GLIDING, "vmctl", glide, *args)
         command = [self.ctl] if self.ctl else ["/bin/zsh", "-c", 'exec "$HOME/.local/bin/vmctl" "$@"', "vmctl"]
         return self.gout(*command, *args) if capture else self.guest(*command, *args)
 
@@ -188,11 +197,11 @@ class VM:
     def glide(self, args):
         # A pointer that jumps is unreadable in a video; outside one the jump is faster.
         if getattr(args, "glide", False):
-            return ["--glide"]
+            return "asked"
         handle = flock_file(self.recording())
         if handle:
             handle.close()
-        return [] if handle else ["--glide"]
+        return None if handle else "recording"
 
     def application(self, explicit=None):
         app = explicit or self.app
@@ -790,9 +799,8 @@ mv -- "$staging/new/$1" /Applications/
                     if not math.isfinite(args.timeout) or not 0 <= args.timeout <= 3600:
                         raise Error("Timeout must be 0..3600 seconds")
                     argv += ["--timeout", str(args.timeout)]
-                if cmd == "clickon":
-                    argv += vm.glide(args)
-                vm.control(*argv)
+                glide = vm.glide(args) if cmd == "clickon" else None
+                vm.control(*argv, **({"glide": glide} if glide else {}))
             elif cmd in ["click", "doubleclick", "rightclick", "move", "hit", "scroll", "drag", "type", "key"]:
                 if hasattr(args, "values"):
                     allowed = {"click": (2,), "doubleclick": (2,), "rightclick": (2,), "move": (2,), "hit": (2,), "scroll": (3, 4), "drag": (4, 5)}[cmd]
@@ -801,7 +809,8 @@ mv -- "$staging/new/$1" /Applications/
                 values = [args.text] if cmd == "type" else ([args.key] + ([args.modifiers] if args.modifiers else [])) if cmd == "key" else [str(x) for x in args.values]
                 # The helper brings the app forward itself, saving a guest call per action.
                 options = ["--app", vm.app] if vm.app and cmd != "hit" else []
-                vm.control(cmd, *values, *options, *(vm.glide(args) if hasattr(args, "values") and cmd != "hit" else []))
+                glide = vm.glide(args) if hasattr(args, "values") and cmd != "hit" else None
+                vm.control(cmd, *values, *options, **({"glide": glide} if glide else {}))
             elif cmd == "exec":
                 if not args.args:
                     raise Error("exec needs a command")

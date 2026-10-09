@@ -8,6 +8,7 @@ import contextlib
 import importlib.machinery
 import importlib.util
 import io
+import subprocess
 import json
 from pathlib import Path
 import sys
@@ -230,14 +231,30 @@ class CaptureSafetyTests(IsolatedState, unittest.TestCase):
             if arguments[0] == "/usr/sbin/screencapture":
                 seen.append(vm.glide(argparse.Namespace(glide=False)))
             self.fake_capture(*arguments, **kwargs)
-        self.assertEqual(vm.glide(argparse.Namespace(glide=False)), [])
-        self.assertEqual(vm.glide(argparse.Namespace(glide=True)), ["--glide"])
+        self.assertIsNone(vm.glide(argparse.Namespace(glide=False)))
+        self.assertEqual(vm.glide(argparse.Namespace(glide=True)), "asked")
         with mock.patch.object(vm, "need"), mock.patch.object(vm, "guest", side_effect=capture), \
              mock.patch.object(cli.subprocess, "run"), contextlib.redirect_stdout(io.StringIO()):
             vm.artifact(self.artifact_args(), True)
             vm.artifact(self.artifact_args())
-        self.assertEqual(seen, [["--glide"], []])
-        self.assertEqual(vm.glide(argparse.Namespace(glide=False)), [])
+        self.assertEqual(seen, ["recording", None])
+        self.assertIsNone(vm.glide(argparse.Namespace(glide=False)))
+
+    def test_glide_is_decided_in_the_guest_by_helper_version(self):
+        # Run the guest-side script against stand-in helpers: one from before `version`, one current.
+        home = self.state / "home"
+        (home / ".local/bin").mkdir(parents=True)
+        helper = home / ".local/bin/vmctl"
+        def run(why):
+            return subprocess.run(["/bin/zsh", "-c", cli.GLIDING, "vmctl", why, "move", "1", "2"], env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        helper.write_text('#!/bin/zsh\n[[ $1 == version ]] && { print -u2 "usage: vmctl ..."; exit 1 }\nprint -r -- "$*"\n'); helper.chmod(0o755)
+        self.assertEqual((run("recording").returncode, run("recording").stdout), (0, "move 1 2\n"))
+        self.assertEqual(run("asked").returncode, 2)
+        self.assertIn("older than --glide", run("asked").stderr)
+        helper.write_text('#!/bin/zsh\n[[ $1 == version ]] && { print 2; exit 0 }\nprint -r -- "$*"\n')
+        self.assertEqual(run("recording").stdout, "move 1 2 --glide\n")
+        self.assertEqual(run("asked").stdout, "move 1 2 --glide\n")
 
     def test_partial_failed_copy_is_removed_and_guest_temp_is_cleaned(self):
         vm = self.vm()
