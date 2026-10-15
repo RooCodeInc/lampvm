@@ -194,15 +194,17 @@ wait                                          # the record call saves /tmp/flow.
 
 When part of the flow must not be filmed, such as a person signing in, run `record --pause` before it and `record --resume` after it. Nothing on screen in between is kept, and the movie carries on from the moment of pausing without a gap, showing the screen as it is at the moment of resuming. The `record` call reports the time left out as `pausedSeconds`. A pause that is never resumed ends at `record --stop`. `--seconds` counts paused time too, so give a take with a long pause a higher limit. To see the screen while paused, a person can open the VM with `view`.
 
+`record --text-check 'name@example.com|Company'` reads the finished movie on the host and fails if any of those words show, giving the seconds where they do; the movie is kept so it can be covered or deleted. It reads every frame, so a single frame's flash is caught too; a mostly still take has few frames, while a long take full of motion takes longer to check. It first draws each word alone into a plain picture and must read it back, so a word text recognition cannot read is refused rather than reported clean. `status` lists each running recording, how long it has run and whether it is paused.
+
 ```sh
 $L record --pause                             # sign-in starts; nothing is filmed from here
 $L wait Test 'Signed in' --exact --timeout 600
 $L record --resume                            # filming carries on from the signed-in screen
 ```
 
-While a recording of the VM is running, `move`, `click`, `doubleclick`, `rightclick`, `drag`, `scroll` and `clickon` carry the pointer to the target in 0.12–0.35 seconds instead of jumping there; `--glide` on any of them does the same without a recording. A VM keeps the guest helper it was prepared with. One whose helper predates the glide (`vmctl version` fails or reports less than 2) is driven without it during a recording, and `--glide` there is an error. One whose helper predates the recorder (less than 3) records with the guest's `screencapture` as before: the take runs for its full `--seconds` and `record --stop` is an error. One whose helper is older than 4 records for 300 seconds at most, and `record --pause` and `--resume` are errors there. Clones of a clean image prepared by the current `setup` have all of these. Prefer `clickon` with a label to `move` then `click` with coordinates: it is one step on screen instead of two. If the app itself makes the viewer wait (a build, a model reply), say so in the pull request rather than cutting the video.
+While a recording of the VM is running, `move`, `click`, `doubleclick`, `rightclick`, `drag`, `scroll` and `clickon` carry the pointer to the target in 0.12–0.35 seconds instead of jumping there; `--glide` on any of them does the same without a recording. A VM keeps the guest helper it was prepared with. One whose helper predates the glide (`vmctl version` fails or reports less than 2) is driven without it during a recording, and `--glide` there is an error. One whose helper predates the recorder (less than 3) records with the guest's `screencapture` as before: the take runs for its full `--seconds` and `record --stop` is an error. One whose helper is older than 4 records for 300 seconds at most, and `record --pause` and `--resume` are errors there. One older than 5 cannot bring a single window forward for `--window`: its app comes forward, so another of the app's windows may cover it, and the report says so. Clones of a clean image prepared by the current `setup` have all of these. Prefer `clickon` with a label to `move` then `click` with coordinates: it is one step on screen instead of two. If the app itself makes the viewer wait (a build, a model reply), say so in the pull request rather than cutting the video.
 
-Cropping uses the app window, not guessed screenshot coordinates. Screenshots use a unique guest temporary filename on every call; omitting the host destination also gives a unique output name. Concurrent captures do not overwrite each other's temporary files, but concurrent UI interactions still require separate VMs.
+Cropping uses the app window, not guessed screenshot coordinates. `--window TITLE` on `shot` and `record` crops to one window instead: the window with that exact title, or else the only one whose title contains it, in any app unless `--app` names one. Several matches, or none, is an error listing the windows. The window is brought forward first; one that stays covered by another app, such as a desktop widget, is an error rather than a picture of what covers it. Screenshots use a unique guest temporary filename on every call; omitting the host destination also gives a unique output name. Concurrent captures do not overwrite each other's temporary files, but concurrent UI interactions still require separate VMs.
 
 Coordinates use screen points with the origin at the top left. They are not screenshot pixels: Retina screenshots may have twice as many pixels. Read `tree`, `find` or `bounds` before clicking. Prefer exact labels and verify observable state afterwards. A successful click hit report confirms the target was under the pointer; it cannot prove the app completed its action.
 
@@ -213,11 +215,11 @@ Global selection: `--name NAME`, `--config FILE`, `--state-dir DIRECTORY`. Envir
 | Command | What it does |
 |---|---|
 | `setup` | Downloads dependencies, builds tools and prepares the guest and clean image. `--from VM` uses a stopped local source. |
-| `build` | Builds the host lock-state and guest input/inspection helpers into external state. |
+| `build` | Builds the host lock-state and text-check helpers and the guest input/inspection helper into external state. |
 | `doctor` | Checks host dependencies, Accessibility and reported guest health, including unfinished Setup Assistant. It does not prove video consent or every interaction. |
 | `start [--wait SECONDS] [--session ID] [--detach]` | Durable FIFO admission, detached boot worker and idle observation. Returns when the VM is ready for commands; rerun to resume the same ticket. `--session` (or `LAMPVM_SESSION`) is the task or thread id `status` groups by; `--owner` is a free description. `--detach` returns once the ticket is saved. |
 | `stop` | Shuts down the selected VM, then forces it off if graceful shutdown times out. |
-| `status [--json]` | Shows every local slot holder, activity/holds, worker health and FIFO line, grouped per session (`sessions` in JSON); includes host lock state if built. |
+| `status [--json]` | Shows every local slot holder, activity/holds, worker health and FIFO line, grouped per session (`sessions` in JSON), and each holder's running recordings; includes host lock state if built. |
 | `view [NAME]` | Opens a running VM in a Screen Sharing window on the host for a person to watch or use. Defaults to the selected VM, else the only one running. Takes no lock and records no activity. |
 | `cancel-start` | Cancels only the selected owned VM’s queued start. |
 | `hold --seconds N --reason TEXT` / `release-hold` | Declares/clears autonomous guest work; protects it from idle flags. |
@@ -234,7 +236,7 @@ Global selection: `--name NAME`, `--config FILE`, `--state-dir DIRECTORY`. Envir
 | `tree [APP] [--json]` | Reads the app's Accessibility tree: roles, frames, labels and values. |
 | `find [APP] TEXT [--json] [--exact] [--role ROLE]` | Finds labelled Accessibility elements; role restricts matches (for example `AXButton`). |
 | `windows [APP]` / `bounds [APP]` | Lists app windows / reports an app window's screen rectangle. |
-| `clickon [APP] TEXT` | Activates the app, finds an element and posts a real click, then reports the target/hit result as JSON. Use `--exact`, `--role ROLE`, zero-based `--index N`, or `--right`. |
+| `clickon [APP] TEXT` | Activates the app, finds an element and posts a real click, then reports the target/hit result as JSON. Use `--exact`, `--role ROLE`, zero-based `--index N`, or `--right`. `--ocr` finds TEXT by reading the screen instead, for buttons Accessibility cannot see such as a web page's: it reads the app's window, the window named by `--window`, or with no app the whole screen. It matches whole words, and text recognition is approximate: it aims at the words' share of a line, so verify the result. |
 | `press [APP] TEXT` | Performs the element's Accessibility press action, with `--exact`, `--role` and `--index`. This is a semantic action; verify the resulting app state. |
 | `hit X Y` | Inspects the Accessibility element under a point and its parents, including role, label, bounds and process ID. It posts no input. |
 | `click X Y` / `doubleclick X Y` | Posts left clicks at screen coordinates. |
@@ -246,10 +248,10 @@ Global selection: `--name NAME`, `--config FILE`, `--state-dir DIRECTORY`. Envir
 | `setvalue [APP] TEXT VALUE [--index N] [--role ROLE]` | Sets a writable Accessibility value directly; useful for controls where key input is unsuitable. This does not simulate typing. |
 | `wait [APP] TEXT [--timeout SEC]` | Polls for an element; `--absent` waits for removal, `--exact` and `--role ROLE` restrict matching. A timeout exits unsuccessfully. |
 | `assert [APP] TEXT` | Immediately checks presence; `--absent` checks absence and `--exact` and `--role ROLE` restrict matching. Failure exits unsuccessfully. |
-| `shot [FILE] [--app APP]` | Captures the desktop, or activates/crops to the selected/configured app window, and copies the PNG to the host. |
-| `record [FILE] [--seconds N] [--app APP]` | Records the guest display, or the selected/configured app's window area, for up to N seconds (1–3600, default 5) and copies the movie to the host. `record --stop` ends the VM's running recordings now; each waiting `record` call then saves its movie. `record --pause` and `record --resume` leave the time between them out of the running recordings. |
-| `exec COMMAND [ARGS…]` | Runs an executable as the guest's logged-in user. |
-| `sh` | Runs stdin as a guest zsh script. |
+| `shot [FILE] [--app APP] [--window TITLE]` | Captures the desktop, or activates/crops to the selected/configured app window or the named window, and copies the PNG to the host. |
+| `record [FILE] [--seconds N] [--app APP] [--window TITLE] [--text-check WORDS]` | Records the guest display, or the selected/configured app's or named window's area, for up to N seconds (1–3600, default 5) and copies the movie to the host. `record --stop` ends the VM's running recordings now; each waiting `record` call then saves its movie. `record --pause` and `record --resume` leave the time between them out of the running recordings. `--text-check` fails the call if the movie shows any of the `|`-separated words. |
+| `exec COMMAND [ARGS…]` | Runs an executable as the guest's logged-in user. If a password or Keychain prompt opens meanwhile, it stops waiting within a few seconds (a prompt already open when it starts is left alone), prints the prompt's text and buttons and fails; the prompt stays open for a person to answer through `view`, or to refuse with `press SecurityAgent Cancel` (or `Deny`). |
+| `sh` | Runs stdin as a guest zsh script, watched for prompts as `exec` is. |
 | `push SOURCE DEST` | Streams a host file/folder into a guest directory. |
 | `pull SOURCE DEST` | Copies one guest file to the host. |
 | `help` | Lists commands and options. |
@@ -283,7 +285,7 @@ bin/lampvm --config config/lamp.json --name test-my-session launch
 
 ## Verify toolkit changes
 
-`tests/build-harness.sh` builds an offline, ad hoc signed AppKit app under ignored `build/`. It provides a click counter, text field, delayed/hidden element, 60 scrolling rows, a drag source/drop target and a right-click context menu. Install it into a disposable private clone, test the commands through the actual guest, and capture cropped proof. No personal app or account is needed. The visible scroll-offset label verifies that wheel input moved the viewport even when Accessibility exposes offscreen rows.
+`tests/build-harness.sh` builds an offline, ad hoc signed AppKit app under ignored `build/`. It provides a click counter, text field, delayed/hidden element, 60 scrolling rows, a drag source/drop target, a right-click context menu, and a second window, "Harness Notes", whose Approve button is drawn without Accessibility, as a web page's can be. Install it into a disposable private clone, test the commands through the actual guest, and capture cropped proof. No personal app or account is needed. The visible scroll-offset label verifies that wheel input moved the viewport even when Accessibility exposes offscreen rows.
 
 Run host-side tests with `python3 -m unittest discover -s tests -v`. The slot suite launches real CLI/worker processes against an isolated fake Tart, kills waiters/workers, checks recovery/FIFO/expiry/cancellation and verifies idle flags without stopping guest jobs. These check wrapper behaviour without substituting for VM tests. `tests/smoke.py` drives the harness through a running private VM and saves command output plus cropped screenshots/recording; read its help before running it. Start only your own prepared VM, set its name/state explicitly and delete that clone after proof.
 

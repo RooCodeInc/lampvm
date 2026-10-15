@@ -87,6 +87,47 @@ def valid_session(session):
     return session
 
 
+def prompt_from_tree(tree):
+    # `vmctl tree` lines are ROLE, POSITION, SIZE and LABEL; AppKit appends internal names such as "_NS:73" to labels.
+    text, buttons = [], []
+    for line in tree.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        label = " | ".join(part for part in parts[3].split(" | ") if not re.fullmatch(r"_NS:\d+|infotext", part))
+        if parts[0] == "AXStaticText" and label:
+            text.append(label)
+        elif parts[0] == "AXButton" and label:
+            buttons.append(label)
+    return {"text": text, "buttons": buttons} if tree.startswith("AXWindow") else None
+
+
+def ocr_target(lines, text, exact=False, index=None, scale=2.0, area="the screen"):
+    # OCR boxes are in image pixels; the click point is in screen points from the captured area's corner.
+    wanted = text.lower()
+    found = [line for line in lines if line["text"].strip().lower() == wanted]
+    # Whole words only: "Me" must not match the "em" inside "element".
+    words = re.compile(r"(?<!\w)" + re.escape(wanted) + r"(?!\w)", re.IGNORECASE)
+    if not exact and not found:
+        found = [line for line in lines if words.search(line["text"])]
+    found.sort(key=lambda line: (round(line["bounds"]["y"] / 10), line["bounds"]["x"]))
+    if not found:
+        raise Error("No text in %s reads %r%s. Read: %s" % (area, text, "; for another window use --window TITLE" if area.startswith("the front") else "",
+                                                          ", ".join(repr(line["text"]) for line in lines[:30])))
+    if index is None and len(found) > 1:
+        raise Error("%d places read %r; choose one with --index N (from the top): %s" % (len(found), text, ", ".join(repr(line["text"]) for line in found)))
+    if index is not None and not 0 <= index < len(found):
+        raise Error("--index must be below %d" % len(found))
+    line = found[index or 0]
+    box = line["bounds"]
+    # Inside a longer line, aim at the words' share of the box; Vision gives the line's box, not each word's.
+    match = words.search(line["text"])
+    start = match.start() if match else -1
+    middle = (start + len(wanted) / 2) / len(line["text"]) if start >= 0 and len(line["text"]) else 0.5
+    return {"text": line["text"], "confidence": round(line.get("confidence", 0), 2),
+            "x": (box["x"] + box["width"] * middle) / scale, "y": (box["y"] + box["height"] / 2) / scale}
+
+
 @contextlib.contextmanager
 def locks(state, names):
     # Every lifecycle operation takes the same sorted order, including its source.
@@ -219,6 +260,8 @@ class VM:
         if version > 3 and self.helper_version() < version:
             raise Error("This VM's guest helper cannot pause a recording. Clone a VM from a clean image prepared with the current helper.")
         if subprocess.run([str(self.tart), "exec", self.name, *command]).returncode == 0:
+            if action != "stop":
+                self.mark_paused(action == "pause")
             print(json.dumps({"vm": self.name, "recording": state}))
         elif version == 3 and self.helper_version() < 3:
             raise Error("This VM's guest helper cannot end a recording early; it runs for its --seconds. Clone a VM from a clean image prepared with the current helper.")
@@ -430,6 +473,166 @@ class VM:
         if result.returncode or status:
             raise Error("File transfer failed")
 
+    def recordings_dir(self):
+        path = self.state / "recordings"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def recordings(self, name=None):
+        # One file per running `record` call; a call that died without removing its file is forgotten here.
+        found = []
+        for entry in sorted(self.recordings_dir().glob("*.json")):
+            try:
+                record = json.loads(entry.read_text())
+            except (OSError, ValueError):
+                continue
+            # A file this code did not write whole is skipped, so one bad file cannot break status for every session.
+            if not (isinstance(record, dict) and type(record.get("pid")) is int and record["pid"] > 0 and isinstance(record.get("vm"), str)
+                    and isinstance(record.get("started_at"), (int, float)) and isinstance(record.get("file"), str)):
+                continue
+            try:
+                os.kill(record["pid"], 0)
+            except ProcessLookupError:
+                entry.unlink(missing_ok=True)
+                continue
+            except OSError:
+                pass  # Alive, but another user's process.
+            if name is None or record["vm"] == name:
+                record["running_seconds"] = round(time.time() - record["started_at"])
+                record.setdefault("limit_seconds", None); record.setdefault("paused", False)
+                record.setdefault("app", None); record.setdefault("window", None)
+                found.append(record)
+        return found
+
+    def mark_paused(self, paused):
+        for entry in self.recordings_dir().glob("*.json"):
+            with contextlib.suppress(OSError, ValueError):
+                record = json.loads(entry.read_text())
+                if record.get("vm") == self.name:
+                    record["paused"] = paused
+                    entry.write_text(json.dumps(record) + "\n")
+
+    def system_prompt(self):
+        # Password and Keychain prompts are SecurityAgent windows. They wait for a person, so a command behind one never ends.
+        try:
+            result = subprocess.run([str(self.tart), "exec", self.name, self.helper(), "tree", "SecurityAgent"], stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, text=True, timeout=20)
+        except subprocess.TimeoutExpired:
+            return None  # A slow look is no evidence of a prompt; the command keeps running.
+        return prompt_from_tree(result.stdout) if result.returncode == 0 else None
+
+    def watched(self, *argv, **kwargs):
+        # Runs a guest command, looking every two seconds for a system prompt it may be waiting on.
+        # A prompt already open when the command starts is not its doing, so only one that opens afterwards stops the wait.
+        # The look has to finish first: a command can open its own prompt within a fraction of a second.
+        before = self.system_prompt()
+        process = subprocess.Popen([str(self.tart), *argv], env={**os.environ, "TART_NO_AUTO_PRUNE": "1"}, **kwargs)
+        try:
+            prompt = self.wait_or_prompt(process, before)
+        except BaseException:
+            # Interrupted: end the host side of the command, as subprocess.run does.
+            process.kill()
+            process.wait()
+            raise
+        if prompt:
+            process.terminate()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=5)
+            print(json.dumps({"vm": self.name, "prompt": "SecurityAgent", **prompt}))
+            raise Error("A system prompt is waiting in the guest: " + " ".join(prompt["text"]) + "\nlampvm stopped waiting; the guest "
+                        "command may still be waiting on the prompt. A person can answer it through `lampvm view`; to refuse it, press " +
+                        " or ".join("`lampvm press SecurityAgent %s --exact`" % b for b in prompt["buttons"] if b in ("Cancel", "Deny")) + ".")
+        if process.returncode:
+            raise Error("command failed (exit %s)" % process.returncode)
+
+    def wait_or_prompt(self, process, before):
+        while True:
+            try:
+                process.wait(timeout=2)
+                return None
+            except subprocess.TimeoutExpired:
+                pass
+            prompt = self.system_prompt()
+            if prompt and prompt != before:
+                return prompt
+            if not prompt:
+                before = None  # Once the earlier prompt is gone, the same prompt opening again is new.
+
+    def find_window(self, title, app=None):
+        # Every app's windows in one guest call; an explicit --app narrows the search.
+        owners = [(app, app)] if app else [(a["bundleIdentifier"] or a["name"], a["name"]) for a in json.loads(self.control("apps", capture=True))]
+        script = 'h="$HOME/.local/bin/vmctl"; for a in "$@"; do print -r -- "$("$h" windows "$a" 2>/dev/null || print "[]")"; done'
+        listed = self.gout("/bin/zsh", "-c", script, "lampvm", *[key for key, _ in owners]).splitlines()
+        windows = [(key, name, window) for (key, name), line in zip(owners, listed) for window in json.loads(line or "[]") if "bounds" in window]
+        if not title.strip():
+            raise Error("--window needs a title")
+        exact = [entry for entry in windows if entry[2]["title"] == title]
+        found = exact or [entry for entry in windows if title.lower() in entry[2]["title"].lower()]
+        if len(found) != 1:
+            titles = sorted({"%s (%s)" % (window["title"], name) for _, name, window in (found or windows) if window["title"]})
+            raise Error(("No window is titled " if not found else "More than one window matches ") + repr(title) +
+                        ". Windows: " + ", ".join(titles))
+        key, name, window = found[0]
+        rect = window["bounds"]
+        x, y = math.floor(rect["x"]), math.floor(rect["y"])
+        bounds = "%d,%d,%d,%d" % (x, y, math.ceil(rect["x"] + rect["width"]) - x, math.ceil(rect["y"] + rect["height"]) - y)
+        return dict(key=key, app=name, title=window["title"], bounds=bounds)
+
+    def show_window(self, window):
+        # The named window comes forward and becomes main, so a crop shows it and its first click counts. A helper
+        # older than 5 cannot raise one window: its app comes forward and the window may stay behind the app's others.
+        raised = self.helper_version() >= 5
+        shown = json.loads(self.control(*(["raise", window["key"], window["title"]] if raised else ["activate", window["key"]]), capture=True))
+        # Some windows, such as desktop widgets, cannot come forward. A capture of one that another app covers would
+        # show that app, so look at five points inside it.
+        x, y, width, height = map(int, window["bounds"].split(","))
+        points = [(x + width * fx, y + height * fy) for fx, fy in ((0.5, 0.5), (0.15, 0.15), (0.85, 0.15), (0.15, 0.85), (0.85, 0.85))]
+        script = 'h="$HOME/.local/bin/vmctl"; while (( $# )); do "$h" hit "$1" "$2" 2>/dev/null || print "{}"; shift 2; done'
+        hits = [json.loads(line) for line in self.gout("/bin/zsh", "-c", script, "lampvm", *["%.0f" % v for point in points for v in point]).splitlines()]
+        covering = {hit["pid"] for hit in hits if hit.get("hit") and hit.get("pid", -1) > 0} - {shown["pid"]}
+        if covering:
+            names = [a["name"] for a in json.loads(self.control("apps", capture=True)) if a["pid"] in covering] or ["another window"]
+            raise Error("The window %r is covered by %s, so a capture would show that instead. Move or close it, then retry." %
+                        (window["title"], ", ".join(names)))
+        return raised
+
+    def ocr_click(self, app, text, args):
+        # For what Accessibility cannot see, such as a web page's own buttons: read the screen and click the words.
+        region, owner, raised = None, app, None
+        if args.window is not None:
+            window = self.find_window(args.window, args.app)
+            region, owner, raised = window["bounds"], None, self.show_window(window)
+        elif app:
+            self.control("activate", app)
+            region = self.control("bounds", app, capture=True)
+        remote = "/tmp/lampvm-ocr-" + uuid.uuid4().hex + ".png"
+        try:
+            self.guest("/usr/sbin/screencapture", "-x", *(["-R" + region] if region else []), remote, stderr=subprocess.DEVNULL)
+            # Vision in the guest reports a missing display scaler on stderr every time; other errors are passed on.
+            result = subprocess.run([str(self.tart), "exec", self.name, self.helper(), "ocr", remote], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            errors = "\n".join(line for line in result.stderr.splitlines() if "AppleM2ScalerParavirtDriver" not in line)
+            if errors:
+                print(errors, file=sys.stderr)
+            if result.returncode:
+                raise Error("Reading the screen failed")
+            read = json.loads(result.stdout)
+        finally:
+            subprocess.run([str(self.tart), "exec", self.name, "/bin/rm", "-f", remote], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if region:
+            x0, y0, width, _ = map(int, region.split(","))
+        else:
+            x0, y0 = 0, 0
+            width = int(re.search(r"now (\d+)x\d+ points", self.control("display", capture=True)).group(1))
+        area = ("the window %r" % args.window if args.window else "the front window of " + app if app else "the screen")
+        target = ocr_target(read["lines"], text, args.exact, args.index, read["width"] / width, area)
+        x, y = x0 + target["x"], y0 + target["y"]
+        glide = self.glide(args)
+        self.control("rightclick" if args.right else "click", "%.1f" % x, "%.1f" % y, *(["--app", owner] if owner else []), **({"glide": glide} if glide else {}))
+        report = {"ocr": target["text"], "confidence": target["confidence"], "x": round(x, 1), "y": round(y, 1)}
+        if raised is False:
+            report["note"] = "the guest helper is older than 5, so the window was not raised; a window that was not in front may take this click only to come forward"
+        print(json.dumps(report))
+
     def artifact(self, args, video=False):
         self.need()
         app = args.app or self.app
@@ -446,18 +649,29 @@ class VM:
         if video and version < 4 and args.seconds > 300:
             raise Error("This VM's guest helper records for 300 seconds at most. Clone a VM from a clean image prepared with the current helper.")
         command = [self.helper(), "record", remote, "--seconds", str(args.seconds)] if own else ["/usr/sbin/screencapture", "-x"]
-        if app:
+        window = getattr(args, "window", None)
+        if window is not None and not window.strip():
+            raise Error("--window needs a title")
+        if app or window:
             # Recording releases the action lock after fixing its capture region,
             # allowing input commands to run during the recording.
             with lock(self.state / "locks" / (self.name + ".lock")) if video else contextlib.nullcontext():
-                self.control("activate", app)
-                bounds = self.control("bounds", app, capture=True)
+                if window:  # Searches every app's windows unless --app names one; a configured app does not narrow it.
+                    found = self.find_window(window, args.app)
+                    app, window, bounds, raised = found["app"], found["title"], found["bounds"], self.show_window(found)
+                else:
+                    self.control("activate", app)
+                    bounds = self.control("bounds", app, capture=True)
                 if not re.fullmatch(r"-?\d+,-?\d+,\d+,\d+", bounds):
                     raise Error("Invalid app window bounds: " + bounds)
                 command += ["--region", bounds] if own else ["-R" + bounds]
         if not own:
             command += (["-v", "-V" + str(args.seconds), "-k"] if video else []) + [remote]
         partial = destination.with_name(destination.name + "." + ident + ".partial")
+        entry = self.recordings_dir() / (self.name + "-" + ident + ".json")
+        if video:  # Shown by `status` while it runs.
+            entry.write_text(json.dumps({"vm": self.name, "file": str(destination.resolve()), "app": app, "window": window, "pid": os.getpid(),
+                                         "started_at": time.time(), "limit_seconds": args.seconds, "paused": False}) + "\n")
         try:
             # Held for the length of the capture so pointer commands know to glide.
             with self.recording().open("a") if video else contextlib.nullcontext() as marker:
@@ -472,14 +686,35 @@ class VM:
             # concurrent call; partial downloads are never exposed as proof.
             os.link(partial, destination)
         finally:
+            entry.unlink(missing_ok=True)
             partial.unlink(missing_ok=True)
             subprocess.run([str(self.tart), "exec", self.name, "/bin/rm", "-f", remote], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         report = {"file": str(destination.resolve()), "app": app, "vm": self.name, "capture": "video" if video else "screenshot"}
+        if window:
+            report["window"] = window
+            if not raised:
+                report["note"] = "the guest helper is older than 5, so the window was not raised; another window of its app may cover it"
         if own:  # How long the take ran: its limit, or less when `record --stop` ended it.
             taken = json.loads(taken.stdout)
             report["seconds"] = round(taken["seconds"], 2)
             if taken.get("pausedSeconds"):  # Left out by `record --pause`; a helper before 4 has no pauses.
                 report["pausedSeconds"] = round(taken["pausedSeconds"], 2)
+        words = [word.strip() for word in (getattr(args, "text_check", None) or "").split("|") if word.strip()]
+        if words:
+            checker = self.state / "bin/textcheck"
+            if not checker.is_file():
+                raise Error("The text checker is not built; run lampvm build. The recording is at " + report["file"])
+            result = subprocess.run([str(checker), str(destination), *words], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if result.returncode not in (0, 1):
+                print(json.dumps(report))
+                raise Error("The text check could not be trusted, so the recording is unchecked: " + result.stderr.strip())
+            report["textCheck"] = json.loads(result.stdout)
+            print(json.dumps(report))
+            if result.returncode:
+                shown = report["textCheck"]["matches"]
+                raise Error("The recording shows " + ", ".join("%r from %.1f s to %.1f s" % (m["word"], m["firstSeconds"], m["lastSeconds"]) for m in shown) +
+                            ". It is kept at " + report["file"] + ": cover or delete it before sharing.")
+            return
         print(json.dumps(report))
 
     def ocr(self, args):
@@ -563,11 +798,13 @@ def parser():
         q = add(name, "capture the guest screen or an app window")
         q.add_argument("file", nargs="?")
         app_option(q)
+        q.add_argument("--window", help="crop to the window with this title (exact, else the one title containing it), in any app unless --app is given")
         if name == "record":
             q.add_argument("--seconds", type=int, default=5, help="longest the recording runs, paused time included (1-%s)" % RECORD_LIMIT)
             signals = q.add_mutually_exclusive_group()
             signals.add_argument("--stop", action="store_true", help="end this VM's running recordings now; each waiting record call then saves its movie")
             signals.add_argument("--pause", action="store_true", help="leave what happens next out of this VM's running recordings until --resume")
+            q.add_argument("--text-check", metavar="WORDS", help="afterwards, read the movie's frames and fail if any of these |-separated words show")
             signals.add_argument("--resume", action="store_true", help="carry on a paused recording; the movie goes on from the moment of pausing without a gap")
     for name in ["tree", "windows", "bounds", "activate"]:
         q = add(name, "inspect or activate an application")
@@ -590,6 +827,8 @@ def parser():
         if name == "clickon":
             q.add_argument("--right", action="store_true")
             q.add_argument("--glide", action="store_true", help=GLIDE)
+            q.add_argument("--ocr", action="store_true", help="find TEXT by reading the screen, for buttons Accessibility cannot see")
+            q.add_argument("--window", help="with --ocr, read only the window with this title")
     for name, count in [("click", 2), ("doubleclick", 2), ("rightclick", 2), ("move", 2), ("hit", 2), ("scroll", 3), ("drag", 4)]:
         q = add(name, "inspect the accessible element under a point" if name == "hit" else "send real guest mouse events")
         q.add_argument("values", nargs="+", type=float)
@@ -643,7 +882,7 @@ def main():
             problems.append("Apple Silicon is required")
         if int(checks["macos"].split(".")[0]) < 14:
             problems.append("macOS 14+ required for tart exec")
-        for tool in ["lockstate", "vmctl"]:
+        for tool in ["lockstate", "textcheck", "vmctl"]:
             if not (vm.state / "bin" / tool).is_file():
                 problems.append("missing built helper: " + tool)
         if not vm.tart.is_file():
@@ -704,6 +943,9 @@ def main():
             Slots(vm.state).reap(vm.machines)
             Slots(vm.state).prune(vm.machines)
             report = Slots(vm.state).report(vm.machines())
+            recordings = vm.recordings()
+            for holder in report['holders']:
+                holder['recordings'] = [r for r in recordings if r['vm'] == holder['name']]
             helper = vm.state / "bin/lockstate"
             if helper.exists():
                 report['host_screen'] = output([helper])
@@ -717,6 +959,9 @@ def main():
                           (holder['name'], holder['session'] or '-', holder.get('owner', 'unknown'), since,
                            holder['idle_seconds'] if holder['idle_seconds'] is not None else '?', holder['attention'], holder['monitor'],
                            " | resets %s" % holder['resets'] if holder.get('resets') else ""))
+                    for take in holder['recordings']:
+                        print("    recording %ss of up to %ss%s%s -> %s" % (take['running_seconds'], take['limit_seconds'],
+                              " (paused)" if take['paused'] else "", " of " + (take['window'] or take['app']) if take['window'] or take['app'] else " of the desktop", take['file']))
                 print("Queue:")
                 for ticket in report['queue']:
                     print("  #%s %s | session %s | owner %s | waited %ss | remaining %ss | %s" %
@@ -775,11 +1020,15 @@ def main():
             return
         vm.need()
         with Slots(vm.state).activity(vm.name, cmd):
+            if cmd == "record" and (args.stop or args.pause or args.resume) and (args.text_check is not None or args.window is not None or args.file):
+                raise Error("--stop, --pause and --resume act on the running recordings; give FILE, --window and --text-check to the record call that starts one")
             if cmd == "record" and (args.stop or args.pause or args.resume):
                 vm.signal_recording("stop" if args.stop else "pause" if args.pause else "resume")
             elif cmd in ["shot", "record"]:
                 if cmd == "record" and not 1 <= args.seconds <= RECORD_LIMIT:
                     raise Error("Record duration must be 1..%s seconds" % RECORD_LIMIT)
+                if cmd == "record" and args.text_check is not None and not any(word.strip() for word in args.text_check.split("|")):
+                    raise Error("--text-check needs at least one word to look for, such as 'name@example.com|Company'")
                 vm.artifact(args, cmd == "record")
             elif cmd == "ocr":
                 vm.ocr(args)
@@ -831,6 +1080,13 @@ mv -- "$staging/new/$1" /Applications/
                 if getattr(args, "json", False):
                     argv.append("--json")
                 vm.control(*argv)
+            elif cmd == "clickon" and args.ocr:
+                if len(args.operands) not in (1, 2):
+                    raise Error("Expected [APP] TEXT")
+                # Without an app, the whole screen is read.
+                vm.ocr_click(args.operands[0] if len(args.operands) == 2 else args.app or vm.app, args.operands[-1], args)
+            elif cmd == "clickon" and args.window is not None:
+                raise Error("--window on clickon needs --ocr")
             elif cmd in ["find", "clickon", "press", "wait", "assert", "setvalue"]:
                 count = 2 if cmd == "setvalue" else 1
                 if len(args.operands) == count:
@@ -866,9 +1122,10 @@ mv -- "$staging/new/$1" /Applications/
             elif cmd == "exec":
                 if not args.args:
                     raise Error("exec needs a command")
-                vm.guest(*args.args)
+                vm.require_tart()
+                vm.watched("exec", vm.name, *args.args)
             elif cmd == "sh":
-                vm.t("exec", "-i", vm.name, "/bin/zsh", "-s")
+                vm.watched("exec", "-i", vm.name, "/bin/zsh", "-s")
             elif cmd == "push":
                 vm.push(args.source, args.destination)
                 print("copied into guest: " + args.destination)

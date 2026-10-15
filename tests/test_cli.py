@@ -125,9 +125,9 @@ class CLISafetyTests(IsolatedState, unittest.TestCase):
     def test_exec_preserves_arguments_without_shell_expansion(self):
         vm = self.vm()
         dangerous = "$(touch /tmp/not-a-command); `whoami`"
-        with mock.patch.object(vm, "need"), mock.patch.object(vm, "guest") as guest:
+        with mock.patch.object(vm, "need"), mock.patch.object(vm, "watched") as watched:
             self.invoke(["exec", "/usr/bin/printf", "%s", dangerous], vm)
-        guest.assert_called_once_with("/usr/bin/printf", "%s", dangerous)
+        watched.assert_called_once_with("exec", vm.name, "/usr/bin/printf", "%s", dangerous)
 
     def test_type_double_dash_preserves_literal_option_text(self):
         vm = self.vm()
@@ -318,6 +318,23 @@ class CaptureSafetyTests(IsolatedState, unittest.TestCase):
             sent = run.call_args.args[0]
             self.assertEqual(sent[1:5], ["exec", vm.name, "/bin/zsh", "-c"])
             self.assertTrue(sent[5].startswith(marker + " && exec /usr/bin/pkill -USR1 -f "))
+
+    def test_system_prompts_read_from_real_guest_trees(self):
+        # `vmctl tree SecurityAgent` in a macOS 26 guest on 2026-10-15: an admin password prompt, then a Keychain prompt.
+        admin = ("AXWindow\t720,306\t260x312\tUntitled\nAXStaticText\t720,258\t218x18\tosascript\n"
+                 "AXStaticText\t720,290\t218x18\tosascript wants to make changes.\nAXStaticText\t720,322\t218x18\tEnter your password to allow this.\n"
+                 "AXTextField\t720,358\t232x26\tManaged via Tart | Username\nAXTextField\t720,390\t232x26\tPassword\n"
+                 "AXButton\t661,432\t113x30\tCancel\nAXButton\t778,432\t113x30\tOK\n")
+        keychain = ("AXWindow\t720,276\t434x186\t_NS:82\nAXImage\t555,235\t66x66\tsecurity | _NS:47\n"
+                    "AXStaticText\t758,227\t320x50\tsecurity wants to use your confidential information stored in \u201clampvm-made-up-item\u201d in your keychain. | _NS:73\n"
+                    "AXStaticText\t758,266\t320x16\tTo allow this, enter the \u201clogin\u201d keychain password. | infotext\n"
+                    "AXStaticText\t630,293\t64x18\tPassword: | _NS:99\nAXTextField\t793,293\t250x26\t_NS:105\n"
+                    "AXButton\t535,337\t26x26\tHelp | _NS:42\nAXButton\t650,337\t104x26\tAlways Allow | _NS:21\n"
+                    "AXButton\t786,337\t81x26\tDeny | _NS:29\nAXButton\t877,337\t81x26\tAllow | _NS:8\n")
+        self.assertEqual(cli.prompt_from_tree(admin), {"text": ["osascript", "osascript wants to make changes.", "Enter your password to allow this."], "buttons": ["Cancel", "OK"]})
+        self.assertEqual(cli.prompt_from_tree(keychain)["buttons"], ["Help", "Always Allow", "Deny", "Allow"])
+        self.assertEqual(cli.prompt_from_tree(keychain)["text"][1], "To allow this, enter the \u201clogin\u201d keychain password.")
+        self.assertIsNone(cli.prompt_from_tree(""))
 
     def test_partial_failed_copy_is_removed_and_guest_temp_is_cleaned(self):
         vm = self.vm()

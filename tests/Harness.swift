@@ -82,8 +82,22 @@ final class ContextArea: NSView {
     @objc func chosen() { status.stringValue = "Context action chosen" }
 }
 
+// Drawn, not a control: Accessibility sees no button here, as with a web page's canvas or custom button.
+final class DrawnButton: NSView {
+    var pressed: () -> Void = {}
+    override func isAccessibilityElement() -> Bool { false }
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.systemGreen.setFill(); NSBezierPath(roundedRect: bounds, xRadius: 8, yRadius: 8).fill()
+        let text = NSAttributedString(string: "Approve", attributes: [.font: NSFont.boldSystemFont(ofSize: 20), .foregroundColor: NSColor.white])
+        text.draw(at: NSPoint(x: (bounds.width - text.size().width) / 2, y: (bounds.height - text.size().height) / 2))
+    }
+    override func mouseDown(with event: NSEvent) { pressed() }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     var window: NSWindow!
+    var notes: NSWindow!
+    let approval = NSTextField(labelWithString: "Approval: waiting")
     var clicks = 0
     let clickStatus = NSTextField(labelWithString: "Clicks: 0")
     let textStatus = NSTextField(labelWithString: "Typed: empty")
@@ -170,6 +184,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         let editItem = NSMenuItem(title: "Edit", action: nil, keyEquivalent: "")
         editItem.submenu = editMenu; menu.addItem(editItem)
         NSApp.mainMenu = menu
+        // A second window, beside the first, for commands that name one window.
+        notes = NSWindow(contentRect: NSRect(x: 1060, y: 460, width: 360, height: 300), styleMask: [.titled, .miniaturizable], backing: .buffered, defer: false)
+        notes.title = "Harness Notes"; notes.isReleasedWhenClosed = false
+        let heading = NSTextField(labelWithString: "Second window"); heading.frame = NSRect(x: 24, y: 250, width: 300, height: 24)
+        let drawn = DrawnButton(frame: NSRect(x: 24, y: 150, width: 160, height: 48)); drawn.pressed = { [weak self] in self?.approval.stringValue = "Approval: approved" }
+        approval.frame = NSRect(x: 24, y: 100, width: 300, height: 24)
+        for view in [heading, drawn, approval] { notes.contentView!.addSubview(view) }
+        notes.orderFront(nil)
         window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
     }
     @objc func clicked() { clicks += 1; clickStatus.stringValue = "Clicks: \(clicks)" }
@@ -188,6 +210,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         text.stringValue = ""; textStatus.stringValue = "Typed: empty"
         hide(); dragStatus.stringValue = "Drag idle"; contextStatus.stringValue = "Context idle"
         scroll.contentView.scroll(to: .zero); scroll.reflectScrolledClipView(scroll.contentView)
+        approval.stringValue = "Approval: waiting"
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 }

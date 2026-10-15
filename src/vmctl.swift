@@ -144,7 +144,7 @@ let optionArguments: [String] = {
     let command = args.first ?? ""
     let required = ["click":3,"doubleclick":3,"rightclick":3,"move":3,"hit":3,"scroll":4,"drag":5,
                     "type":2,"key":2,"activate":2,"quit":2,"tree":2,"find":3,"clickon":3,"press":3,
-                    "setvalue":4,"wait":3,"assert":3,"bounds":2,"windows":2,"ocr":2,"record":2]
+                    "setvalue":4,"wait":3,"assert":3,"bounds":2,"windows":2,"raise":3,"ocr":2,"record":2]
     var start = required[command] ?? 1
     if let count = required[command], args.count < count { fail("not enough arguments for \(command); run vmctl without arguments for usage") }
     if ["scroll","drag","key"].contains(command), args.count > start, !args[start].hasPrefix("--") { start += 1 }
@@ -429,6 +429,15 @@ case "type": require(2,"type TEXT [--app APP]"); trusted(); activateConfigured()
 case "key":
     require(2,"key NAME [cmd,shift,alt,ctrl] [--app APP]"); trusted(); activateConfigured()
     guard let code = keyCodes[args[1].lowercased()] else { fail("unknown key \(args[1]); use type for arbitrary Unicode") }; key(code,args.count > 2 && !args[2].hasPrefix("--") ? flags(args[2]) : [])
+// Brings one named window forward and makes it the app's main window, so a crop shows it and its first click counts.
+case "raise":
+    require(3,"raise APP TITLE"); trusted(); let application = app(args[1])
+    let windows: [AXUIElement] = attribute(AXUIElementCreateApplication(application.processIdentifier),kAXWindowsAttribute) ?? []
+    guard let window = windows.first(where: { (attribute($0,kAXTitleAttribute) as String?) == args[2] }) else { fail("\(args[1]) has no window titled \(args[2])") }
+    activate(application)
+    AXUIElementSetAttributeValue(window,kAXMainAttribute as CFString,kCFBooleanTrue)
+    let raised = AXUIElementPerformAction(window,kAXRaiseAction as CFString) == .success
+    pause(0.2); json(["raised":raised,"title":args[2],"pid":application.processIdentifier])
 case "activate": require(2,"activate APP"); trusted(); let application = app(args[1]); activate(application); json(["frontmost":true,"pid":application.processIdentifier])
 case "quit":
     require(2,"quit APP")
@@ -546,8 +555,8 @@ case "record":
     recorder.start(region: region) { DispatchQueue.main.asyncAfter(deadline: .now() + limit, execute: stop) }
     dispatchMain()
 // What this helper can do, for a host newer or older than it: 2 added --glide, 3 added record,
-// 4 added pause and resume and lifted the limit from 300 to 3600 seconds.
-case "version": print(4)
+// 4 added pause and resume and lifted the limit from 300 to 3600 seconds, 5 added raise.
+case "version": print(5)
 default:
     fail("usage: vmctl click|doubleclick|rightclick X Y | move X Y | hit X Y | scroll X Y DY [DX] | drag X1 Y1 X2 Y2 [SECONDS] | type TEXT | key NAME [mods] | activate|quit APP | tree APP [--json] | find|clickon|press APP TEXT | wait|assert APP TEXT [--absent] [--timeout SEC] | setvalue APP TEXT VALUE | bounds|windows APP | apps | ocr IMAGE_PATH | trusted [--prompt] | display [WIDTH HEIGHT]")
 }
