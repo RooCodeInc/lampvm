@@ -8,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shlex
 import socket
 import subprocess
 import sys
@@ -53,6 +54,8 @@ if [[ $version == <-> && $version -ge 2 ]]; then exec "$helper" "$@" --glide; fi
 if [[ $why == asked ]]; then print -u2 "This VM's guest helper is older than --glide. Clone a VM from a clean image prepared with the current helper."; exit 2; fi
 exec "$helper" "$@"'''
 RECORDER = r"/vmctl record /tmp/lampvm-[0-9a-f]+\.mov( |$)"
+RECORD_LIMIT = 3600
+PAUSE = "%%s /tmp/lampvm-record-paused && exec /usr/bin/pkill -USR1 -f %s" % shlex.quote(RECORDER)
 GLIDE = "move the pointer to the target smoothly; always on while this VM is being recorded"
 
 
@@ -103,6 +106,7 @@ class VM:
             raise Error("Runtime configuration must be a JSON object")
         if (args.config or os.environ.get("LAMPVM_CONFIG")) and not config_path.is_file():
             raise Error("Configuration file does not exist: " + str(config_path))
+        overlay = {}
         if config_path.exists() and config_path.resolve() != runtime.resolve():
             overlay = json.loads(config_path.read_text())
             if not isinstance(overlay, dict):
@@ -110,7 +114,14 @@ class VM:
             self.config.update(overlay)
         self.name = valid_name(args.name or os.environ.get("LAMPVM_NAME") or self.config.get("vm", "lampvm"))
         self.clean = valid_name(self.config.get("clean", "lampvm-clean"))
-        self.app = getattr(args, "app", None) or os.environ.get("LAMPVM_APP") or self.config.get("app")
+        # A flag outranks the environment: `--config` naming an app, or `{"app": null}` for the
+        # whole desktop, beats LAMPVM_APP, which beats the app of LAMPVM_CONFIG or runtime state.
+        if getattr(args, "app", None):
+            self.app = args.app
+        elif args.config and "app" in (overlay if config_path.resolve() != runtime.resolve() else self.config):
+            self.app = self.config.get("app")
+        else:
+            self.app = os.environ.get("LAMPVM_APP") or self.config.get("app")
         self.tart = Path(os.environ.get("LAMPVM_TART", str(self.state / "tart/tart.app/Contents/MacOS/tart"))).expanduser()
         self.ctl = None
 
@@ -197,12 +208,19 @@ class VM:
         text = result.stdout.strip()
         return int(text) if result.returncode == 0 and text.isdigit() else 1
 
-    def stop_recording(self):
+    def signal_recording(self, action):
         self.need()
         # The helper closes its movie on an interrupt; each waiting record call then copies it out.
-        if subprocess.run([str(self.tart), "exec", self.name, "/usr/bin/pkill", "-INT", "-f", RECORDER]).returncode == 0:
-            print(json.dumps({"vm": self.name, "recording": "stopping"}))
-        elif self.helper_version() < 3:
+        # Pause and resume are user signals, which end a helper older than them without saving its movie.
+        # Repeated user signals merge, so the helper reads whether to pause from a file, not from their order.
+        state, version, command = {"stop": ("stopping", 3, ["/usr/bin/pkill", "-INT", "-f", RECORDER]),
+                                   "pause": ("paused", 4, ["/bin/zsh", "-c", PAUSE % "/usr/bin/touch"]),
+                                   "resume": ("recording", 4, ["/bin/zsh", "-c", PAUSE % "/bin/rm -f"])}[action]
+        if version > 3 and self.helper_version() < version:
+            raise Error("This VM's guest helper cannot pause a recording. Clone a VM from a clean image prepared with the current helper.")
+        if subprocess.run([str(self.tart), "exec", self.name, *command]).returncode == 0:
+            print(json.dumps({"vm": self.name, "recording": state}))
+        elif version == 3 and self.helper_version() < 3:
             raise Error("This VM's guest helper cannot end a recording early; it runs for its --seconds. Clone a VM from a clean image prepared with the current helper.")
         else:
             raise Error("No recording is running in this VM")
@@ -423,7 +441,10 @@ class VM:
         destination.parent.mkdir(parents=True, exist_ok=True)
         remote = "/tmp/lampvm-" + ident + extension
         # A guest whose helper cannot record keeps using screencapture, which runs its full length.
-        own = video and self.helper_version() >= 3
+        version = self.helper_version() if video else 0
+        own = version >= 3
+        if video and version < 4 and args.seconds > 300:
+            raise Error("This VM's guest helper records for 300 seconds at most. Clone a VM from a clean image prepared with the current helper.")
         command = [self.helper(), "record", remote, "--seconds", str(args.seconds)] if own else ["/usr/sbin/screencapture", "-x"]
         if app:
             # Recording releases the action lock after fixing its capture region,
@@ -455,7 +476,10 @@ class VM:
             subprocess.run([str(self.tart), "exec", self.name, "/bin/rm", "-f", remote], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         report = {"file": str(destination.resolve()), "app": app, "vm": self.name, "capture": "video" if video else "screenshot"}
         if own:  # How long the take ran: its limit, or less when `record --stop` ended it.
-            report["seconds"] = round(json.loads(taken.stdout)["seconds"], 2)
+            taken = json.loads(taken.stdout)
+            report["seconds"] = round(taken["seconds"], 2)
+            if taken.get("pausedSeconds"):  # Left out by `record --pause`; a helper before 4 has no pauses.
+                report["pausedSeconds"] = round(taken["pausedSeconds"], 2)
         print(json.dumps(report))
 
     def ocr(self, args):
@@ -540,8 +564,11 @@ def parser():
         q.add_argument("file", nargs="?")
         app_option(q)
         if name == "record":
-            q.add_argument("--seconds", type=int, default=5, help="longest the recording runs (1-300)")
-            q.add_argument("--stop", action="store_true", help="end this VM's running recordings now; each waiting record call then saves its movie")
+            q.add_argument("--seconds", type=int, default=5, help="longest the recording runs, paused time included (1-%s)" % RECORD_LIMIT)
+            signals = q.add_mutually_exclusive_group()
+            signals.add_argument("--stop", action="store_true", help="end this VM's running recordings now; each waiting record call then saves its movie")
+            signals.add_argument("--pause", action="store_true", help="leave what happens next out of this VM's running recordings until --resume")
+            signals.add_argument("--resume", action="store_true", help="carry on a paused recording; the movie goes on from the moment of pausing without a gap")
     for name in ["tree", "windows", "bounds", "activate"]:
         q = add(name, "inspect or activate an application")
         q.add_argument("app", nargs="?")
@@ -748,11 +775,11 @@ def main():
             return
         vm.need()
         with Slots(vm.state).activity(vm.name, cmd):
-            if cmd == "record" and args.stop:
-                vm.stop_recording()
+            if cmd == "record" and (args.stop or args.pause or args.resume):
+                vm.signal_recording("stop" if args.stop else "pause" if args.pause else "resume")
             elif cmd in ["shot", "record"]:
-                if cmd == "record" and not 1 <= args.seconds <= 300:
-                    raise Error("Record duration must be 1..300 seconds")
+                if cmd == "record" and not 1 <= args.seconds <= RECORD_LIMIT:
+                    raise Error("Record duration must be 1..%s seconds" % RECORD_LIMIT)
                 vm.artifact(args, cmd == "record")
             elif cmd == "ocr":
                 vm.ocr(args)

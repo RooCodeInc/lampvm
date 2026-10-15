@@ -143,6 +143,19 @@ class CLISafetyTests(IsolatedState, unittest.TestCase):
             self.invoke(["find", "Search", "--app", "Chosen"], vm)
         control.assert_called_once_with("find", "Chosen", "Search")
 
+    def test_config_flag_choosing_the_desktop_outranks_the_app_environment(self):
+        # Seen in a guest: LAMPVM_APP cropped a `--config {"app": null}` recording to one window.
+        desktop, other = self.state / "desktop.json", self.state / "other.json"
+        desktop.write_text('{"app": null}\n')
+        other.write_text('{"app": "Chosen"}\n')
+        with mock.patch.dict(cli.os.environ, {"LAMPVM_APP": "FromEnvironment"}):
+            app = lambda *arguments: cli.VM(cli.parser().parse_args([*arguments, "record"])).app
+            self.assertIsNone(app("--config", str(desktop)))
+            self.assertEqual(app("--config", str(other)), "Chosen")
+            self.assertEqual(app(), "FromEnvironment")
+            (self.state / "config.json").write_text('{"app": null}\n')
+            self.assertEqual(app(), "FromEnvironment")
+
     def test_no_app_specific_default(self):
         vm = self.vm()
         with self.assertRaisesRegex(cli.Error, "Specify APP"):
@@ -278,16 +291,33 @@ class CaptureSafetyTests(IsolatedState, unittest.TestCase):
         self.assertFalse(re.search(cli.RECORDER, "/usr/sbin/screencapture -x -v -V300 -k /tmp/lampvm-0123abcd.mov"))
         with mock.patch.object(vm, "need"), mock.patch.object(vm, "helper_version", return_value=3), contextlib.redirect_stdout(io.StringIO()), \
              mock.patch.object(cli.subprocess, "run", return_value=mock.Mock(returncode=0)) as run:
-            vm.stop_recording()
+            vm.signal_recording("stop")
         self.assertEqual(run.call_args.args[0][1:], ["exec", vm.name, "/usr/bin/pkill", "-INT", "-f", cli.RECORDER])
         with mock.patch.object(vm, "need"), mock.patch.object(vm, "helper_version", return_value=3), \
              mock.patch.object(cli.subprocess, "run", return_value=mock.Mock(returncode=1)):
             with self.assertRaisesRegex(cli.Error, "No recording is running"):
-                vm.stop_recording()
+                vm.signal_recording("stop")
         with mock.patch.object(vm, "need"), mock.patch.object(vm, "helper_version", return_value=2), \
              mock.patch.object(cli.subprocess, "run", return_value=mock.Mock(returncode=1)):
             with self.assertRaisesRegex(cli.Error, "cannot end a recording early"):
-                vm.stop_recording()
+                vm.signal_recording("stop")
+
+    def test_pause_never_signals_a_helper_that_a_user_signal_would_kill(self):
+        # A helper before 4 has no handler for SIGUSR1, so it would end without saving the movie.
+        vm = self.vm()
+        vm.ctl = "/Users/admin/.local/bin/vmctl"
+        for action, marker in [("pause", "/usr/bin/touch /tmp/lampvm-record-paused"), ("resume", "/bin/rm -f /tmp/lampvm-record-paused")]:
+            with mock.patch.object(vm, "need"), mock.patch.object(vm, "helper_version", return_value=3), \
+                 mock.patch.object(cli.subprocess, "run") as run:
+                with self.assertRaisesRegex(cli.Error, "cannot pause"):
+                    vm.signal_recording(action)
+            run.assert_not_called()
+            with mock.patch.object(vm, "need"), mock.patch.object(vm, "helper_version", return_value=4), contextlib.redirect_stdout(io.StringIO()), \
+                 mock.patch.object(cli.subprocess, "run", return_value=mock.Mock(returncode=0)) as run:
+                vm.signal_recording(action)
+            sent = run.call_args.args[0]
+            self.assertEqual(sent[1:5], ["exec", vm.name, "/bin/zsh", "-c"])
+            self.assertTrue(sent[5].startswith(marker + " && exec /usr/bin/pkill -USR1 -f "))
 
     def test_partial_failed_copy_is_removed_and_guest_temp_is_cleaned(self):
         vm = self.vm()

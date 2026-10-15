@@ -177,10 +177,10 @@ A viewer sees every second the screen stands still, so the whole take is one scr
 1. Rehearse first without recording: find each label with `tree`/`find`, run every step once and settle the script. Reset the app to its starting state afterwards.
 2. Run the script below in one shell call. Do not issue the steps as separate tool calls: the time you spend reading output between them is a frozen screen in the video.
 3. Wait on what the app shows (`wait APP TEXT`, `wait ... --absent`), never `sleep`. `wait` returns the moment the text is there. Keep a `sleep` of a second or less only where the viewer needs to read a result.
-4. End with `record --stop` as soon as the last result is on screen. `--seconds` is only the upper limit (300 at most), so a take is never sized in advance and nothing has to be cut out afterwards.
+4. End with `record --stop` as soon as the last result is on screen. `--seconds` is only the upper limit (3600 at most), so a take is never sized in advance and nothing has to be cut out afterwards.
 
 ```sh
-$L record /tmp/flow.mov --seconds 300 &      # upper limit; stopped below
+$L record /tmp/flow.mov --seconds 600 &      # upper limit; stopped below
 $L wait Test 'Continue' --exact --timeout 10  # also gives the recording time to start
 $L clickon Test 'Continue' --exact
 $L clickon Test 'Name' --exact
@@ -192,7 +192,15 @@ $L record --stop
 wait                                          # the record call saves /tmp/flow.mov
 ```
 
-While a recording of the VM is running, `move`, `click`, `doubleclick`, `rightclick`, `drag`, `scroll` and `clickon` carry the pointer to the target in 0.12–0.35 seconds instead of jumping there; `--glide` on any of them does the same without a recording. A VM keeps the guest helper it was prepared with. One whose helper predates the glide (`vmctl version` fails or reports less than 2) is driven without it during a recording, and `--glide` there is an error. One whose helper predates the recorder (less than 3) records with the guest's `screencapture` as before: the take runs for its full `--seconds` and `record --stop` is an error. Clones of a clean image prepared by the current `setup` have both. Prefer `clickon` with a label to `move` then `click` with coordinates: it is one step on screen instead of two. If the app itself makes the viewer wait (a build, a model reply), say so in the pull request rather than cutting the video.
+When part of the flow must not be filmed, such as a person signing in, run `record --pause` before it and `record --resume` after it. Nothing on screen in between is kept, and the movie carries on from the moment of pausing without a gap, showing the screen as it is at the moment of resuming. The `record` call reports the time left out as `pausedSeconds`. A pause that is never resumed ends at `record --stop`. `--seconds` counts paused time too, so give a take with a long pause a higher limit. To see the screen while paused, a person can open the VM with `view`.
+
+```sh
+$L record --pause                             # sign-in starts; nothing is filmed from here
+$L wait Test 'Signed in' --exact --timeout 600
+$L record --resume                            # filming carries on from the signed-in screen
+```
+
+While a recording of the VM is running, `move`, `click`, `doubleclick`, `rightclick`, `drag`, `scroll` and `clickon` carry the pointer to the target in 0.12–0.35 seconds instead of jumping there; `--glide` on any of them does the same without a recording. A VM keeps the guest helper it was prepared with. One whose helper predates the glide (`vmctl version` fails or reports less than 2) is driven without it during a recording, and `--glide` there is an error. One whose helper predates the recorder (less than 3) records with the guest's `screencapture` as before: the take runs for its full `--seconds` and `record --stop` is an error. One whose helper is older than 4 records for 300 seconds at most, and `record --pause` and `--resume` are errors there. Clones of a clean image prepared by the current `setup` have all of these. Prefer `clickon` with a label to `move` then `click` with coordinates: it is one step on screen instead of two. If the app itself makes the viewer wait (a build, a model reply), say so in the pull request rather than cutting the video.
 
 Cropping uses the app window, not guessed screenshot coordinates. Screenshots use a unique guest temporary filename on every call; omitting the host destination also gives a unique output name. Concurrent captures do not overwrite each other's temporary files, but concurrent UI interactions still require separate VMs.
 
@@ -200,7 +208,7 @@ Coordinates use screen points with the origin at the top left. They are not scre
 
 ## Commands
 
-Global selection: `--name NAME`, `--config FILE`, `--state-dir DIRECTORY`. Environment equivalents: `LAMPVM_NAME`, `LAMPVM_CONFIG`, `LAMPVM_STATE_DIR`; `LAMPVM_SESSION` is the task or thread id for `start`; `LAMPVM_APP` sets a default target app; `LAMPVM_TART` selects an existing Tart executable. See `help` for exact argument order.
+Global selection: `--name NAME`, `--config FILE`, `--state-dir DIRECTORY`. Environment equivalents: `LAMPVM_NAME`, `LAMPVM_CONFIG`, `LAMPVM_STATE_DIR`; `LAMPVM_SESSION` is the task or thread id for `start`; `LAMPVM_APP` sets a default target app; an `app` in the file given with `--config`, including `"app": null` for the whole desktop, takes its place for that command, as does `--app`; `LAMPVM_TART` selects an existing Tart executable. See `help` for exact argument order.
 
 | Command | What it does |
 |---|---|
@@ -239,7 +247,7 @@ Global selection: `--name NAME`, `--config FILE`, `--state-dir DIRECTORY`. Envir
 | `wait [APP] TEXT [--timeout SEC]` | Polls for an element; `--absent` waits for removal, `--exact` and `--role ROLE` restrict matching. A timeout exits unsuccessfully. |
 | `assert [APP] TEXT` | Immediately checks presence; `--absent` checks absence and `--exact` and `--role ROLE` restrict matching. Failure exits unsuccessfully. |
 | `shot [FILE] [--app APP]` | Captures the desktop, or activates/crops to the selected/configured app window, and copies the PNG to the host. |
-| `record [FILE] [--seconds N] [--app APP]` | Records the guest display, or the selected/configured app's window area, for up to N seconds (1–300, default 5) and copies the movie to the host. `record --stop` ends the VM's running recordings now; each waiting `record` call then saves its movie. |
+| `record [FILE] [--seconds N] [--app APP]` | Records the guest display, or the selected/configured app's window area, for up to N seconds (1–3600, default 5) and copies the movie to the host. `record --stop` ends the VM's running recordings now; each waiting `record` call then saves its movie. `record --pause` and `record --resume` leave the time between them out of the running recordings. |
 | `exec COMMAND [ARGS…]` | Runs an executable as the guest's logged-in user. |
 | `sh` | Runs stdin as a guest zsh script. |
 | `push SOURCE DEST` | Streams a host file/folder into a guest directory. |

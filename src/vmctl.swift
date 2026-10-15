@@ -26,11 +26,14 @@ func pause(_ seconds: Double) {
 }
 // Records the main display with ScreenCaptureKit. A frame arrives only when the screen changes,
 // and the movie ends at the moment of stopping, so a still screen is kept at its real length.
+// A pause leaves its frames out and moves every later frame back by its length, so the movie has no gap.
 final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     let url: URL
     let queue = DispatchQueue(label: "lampvm.record")
     var stream: SCStream?, writer: AVAssetWriter?, input: AVAssetWriterInput?
     var first = CMTime.invalid, frames = 0, latest: CMSampleBuffer?
+    var pausedAt: CMTime?, resumedAt = CMTime.invalid, skipped = CMTime.zero, unseen: CMSampleBuffer?
+    let frame = CMTime(value: 1, timescale: 60)
     init(url: URL) { self.url = url }
     func start(region: CGRect?, started: @escaping () -> Void) {
         SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, error in
@@ -67,34 +70,67 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
     func stream(_ stream: SCStream, didOutputSampleBuffer sample: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .screen, sample.isValid, let writer, let input,
+        guard type == .screen, sample.isValid, writer != nil,
               let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
               let status = attachments.first?[.status] as? Int, SCFrameStatus(rawValue: status) == .complete else { return }
-        if !first.isValid { first = sample.presentationTimeStamp; writer.startSession(atSourceTime: first) }
-        if input.isReadyForMoreMediaData, input.append(sample) { frames += 1; latest = sample }
+        if pausedAt != nil { unseen = sample; return }
+        // Shown during the pause but delivered after it.
+        if resumedAt.isValid, CMTimeCompare(sample.presentationTimeStamp, resumedAt) < 0 { return }
+        if write(sample, at: CMTimeSubtract(sample.presentationTimeStamp, skipped)) { frames += 1 }
     }
-    func stream(_ stream: SCStream, didStopWithError error: Error) { fail("recording stopped: \(error.localizedDescription)") }
-    func finish(_ done: @escaping (Double, Int) -> Void) {
-        // Frame times are on the host clock, so the last frame is held until now.
-        let end = CMClockGetTime(CMClockGetHostTimeClock())
-        let close = {
-            self.queue.async {
-                guard let writer = self.writer, let input = self.input, self.first.isValid else { fail("no frame was captured; grant Screen Recording to vmctl") }
-                // A movie ends at its last frame, so show the last one again at the moment of stopping.
-                let again = CMTimeSubtract(end, CMTime(value: 1, timescale: 60))
-                if let latest = self.latest, CMTimeCompare(again, latest.presentationTimeStamp) > 0 {
-                    var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: again, decodeTimeStamp: .invalid), held: CMSampleBuffer?
-                    if CMSampleBufferCreateCopyWithNewTiming(allocator: nil, sampleBuffer: latest, sampleTimingEntryCount: 1, sampleTimingArray: &timing, sampleBufferOut: &held) == noErr,
-                       let held, input.isReadyForMoreMediaData { input.append(held) }
-                }
-                input.markAsFinished(); writer.endSession(atSourceTime: end)
-                writer.finishWriting {
-                    guard writer.status == .completed else { fail("cannot finish the movie: \(writer.error?.localizedDescription ?? "unknown error")") }
-                    done(CMTimeGetSeconds(CMTimeSubtract(end, self.first)), self.frames)
-                }
+    @discardableResult func write(_ sample: CMSampleBuffer, at time: CMTime) -> Bool {
+        guard let writer, let input else { return false }
+        // Frames closer together than one at 60 per second, as around a pause, give players times out of order.
+        let time = latest.map { CMTimeMaximum(time, CMTimeAdd($0.presentationTimeStamp, frame)) } ?? time
+        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: time, decodeTimeStamp: .invalid), moved: CMSampleBuffer?
+        guard CMSampleBufferCreateCopyWithNewTiming(allocator: nil, sampleBuffer: sample, sampleTimingEntryCount: 1, sampleTimingArray: &timing, sampleBufferOut: &moved) == noErr,
+              let moved else { return false }
+        if !first.isValid { first = time; writer.startSession(atSourceTime: first) }
+        guard input.isReadyForMoreMediaData, input.append(moved) else { return false }
+        latest = moved; return true
+    }
+    // A movie shows its last frame only up to that frame's time, so show it again just before `time`.
+    func hold(until time: CMTime) {
+        let again = CMTimeSubtract(time, frame)
+        if let latest, CMTimeCompare(again, CMTimeAdd(latest.presentationTimeStamp, frame)) >= 0 { write(latest, at: again) }
+    }
+    func pause(_ wanted: Bool) {
+        queue.async {
+            let now = CMClockGetTime(CMClockGetHostTimeClock())
+            if wanted, self.pausedAt == nil {
+                self.hold(until: CMTimeSubtract(now, self.skipped)); self.pausedAt = now
+            } else if !wanted, let pausedAt = self.pausedAt {
+                // The screen may have changed while paused and stay still afterwards, so go on from how it looks now.
+                if let unseen = self.unseen, self.write(unseen, at: CMTimeSubtract(pausedAt, self.skipped)) { self.frames += 1 }
+                self.skipped = CMTimeAdd(self.skipped, CMTimeSubtract(now, pausedAt))
+                self.pausedAt = nil; self.unseen = nil; self.resumedAt = now
             }
         }
-        if let stream { stream.stopCapture { _ in close() } } else { close() }
+    }
+    func stream(_ stream: SCStream, didStopWithError error: Error) { fail("recording stopped: \(error.localizedDescription)") }
+    func finish(_ done: @escaping (Double, Int, Double) -> Void) {
+        // Frame times are on the host clock, so the last frame is held until now, or until the pause it was stopped in.
+        // Read on the recording queue, after any pause or resume asked for before stopping.
+        queue.async {
+            let now = CMClockGetTime(CMClockGetHostTimeClock())
+            let close = {
+                self.queue.async {
+                    guard let writer = self.writer, let input = self.input else { fail("recording did not start") }
+                    guard self.first.isValid else {
+                        fail(self.pausedAt != nil || self.skipped != .zero ? "the recording was paused before anything was filmed, so there is no movie" : "no frame was captured; grant Screen Recording to vmctl")
+                    }
+                    let paused = CMTimeAdd(self.skipped, self.pausedAt.map { CMTimeSubtract(now, $0) } ?? .zero)
+                    let end = CMTimeSubtract(now, paused)
+                    self.hold(until: end)
+                    input.markAsFinished(); writer.endSession(atSourceTime: end)
+                    writer.finishWriting {
+                        guard writer.status == .completed else { fail("cannot finish the movie: \(writer.error?.localizedDescription ?? "unknown error")") }
+                        done(CMTimeGetSeconds(CMTimeSubtract(end, self.first)), self.frames, CMTimeGetSeconds(paused))
+                    }
+                }
+            }
+            if let stream = self.stream { stream.stopCapture { _ in close() } } else { close() }
+        }
     }
 }
 func require(_ count: Int, _ usage: String) { if args.count < count { fail("usage: vmctl " + usage) } }
@@ -484,7 +520,7 @@ case "trusted":
     print(value ? "yes" : "no"); exit(value ? 0 : 1)
 case "record":
     require(2,"record FILE [--seconds N] [--region X,Y,W,H]")
-    guard let limit = Double(option("--seconds") ?? "300"), limit >= 1, limit <= 300 else { fail("record duration must be 1…300 seconds") }
+    guard let limit = Double(option("--seconds") ?? "3600"), limit >= 1, limit <= 3600 else { fail("record duration must be 1…3600 seconds") }
     var region: CGRect?
     if let text = option("--region") {
         let parts = text.split(separator: ",").compactMap { Double($0) }
@@ -495,19 +531,23 @@ case "record":
     var stopping = false
     let stop = {
         if stopping { return }; stopping = true
-        recorder.finish { seconds, frames in json(["file":args[1],"seconds":seconds,"frames":frames]); exit(0) }
+        recorder.finish { seconds, frames, paused in json(["file":args[1],"seconds":seconds,"frames":frames,"pausedSeconds":paused]); exit(0) }
     }
     // An interrupt or the time limit ends the take; either way the movie is closed before exiting.
+    // The time limit counts paused time too. SIGUSR1 pauses while the pause file exists and resumes once it is gone:
+    // repeated signals are merged, so the file rather than their order says which came last.
     var signals: [DispatchSourceSignal] = []
-    for number in [SIGINT, SIGTERM] {
+    let pauseFile = "/tmp/lampvm-record-paused"
+    for (number, handler) in [(SIGINT, stop), (SIGTERM, stop), (SIGUSR1, { recorder.pause(FileManager.default.fileExists(atPath: pauseFile)) })] {
         signal(number, SIG_IGN)
         let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
-        source.setEventHandler(handler: stop); source.resume(); signals.append(source)
+        source.setEventHandler(handler: handler); source.resume(); signals.append(source)
     }
     recorder.start(region: region) { DispatchQueue.main.asyncAfter(deadline: .now() + limit, execute: stop) }
     dispatchMain()
-// What this helper can do, for a host newer or older than it: 2 added --glide, 3 added record.
-case "version": print(3)
+// What this helper can do, for a host newer or older than it: 2 added --glide, 3 added record,
+// 4 added pause and resume and lifted the limit from 300 to 3600 seconds.
+case "version": print(4)
 default:
     fail("usage: vmctl click|doubleclick|rightclick X Y | move X Y | hit X Y | scroll X Y DY [DX] | drag X1 Y1 X2 Y2 [SECONDS] | type TEXT | key NAME [mods] | activate|quit APP | tree APP [--json] | find|clickon|press APP TEXT | wait|assert APP TEXT [--absent] [--timeout SEC] | setvalue APP TEXT VALUE | bounds|windows APP | apps | ocr IMAGE_PATH | trusted [--prompt] | display [WIDTH HEIGHT]")
 }
