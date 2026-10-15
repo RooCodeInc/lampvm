@@ -221,6 +221,13 @@ class ViewTests(IsolatedState, unittest.TestCase):
 
 
 class CaptureSafetyTests(IsolatedState, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        # These check file handling; the notification banner check reads the guest and is proven in a real VM.
+        refuse = mock.patch.object(cli.VM, "refuse_banners")
+        refuse.start()
+        self.addCleanup(refuse.stop)
+
     def artifact_args(self, file=None):
         return argparse.Namespace(app=None, file=file, seconds=1)
 
@@ -335,6 +342,18 @@ class CaptureSafetyTests(IsolatedState, unittest.TestCase):
         self.assertEqual(cli.prompt_from_tree(keychain)["buttons"], ["Help", "Always Allow", "Deny", "Allow"])
         self.assertEqual(cli.prompt_from_tree(keychain)["text"][1], "To allow this, enter the \u201clogin\u201d keychain password.")
         self.assertIsNone(cli.prompt_from_tree(""))
+
+    def test_notification_banner_found_from_real_guest_tree(self):
+        # `vmctl tree com.apple.notificationcenterui --json` in a macOS 26 guest on 2026-10-15, with a notification
+        # permission banner up, trimmed to its windows. The banner's top edge covered a window starting at y 108.
+        items = json.loads((ROOT / "tests/fixtures/notification-center-banner.json").read_text())
+        found = cli.banners_from_tree(items)
+        self.assertEqual([b["bounds"] for b in found], [{"x": 1080, "y": 46, "width": 344, "height": 73}])
+        self.assertTrue(found[0]["text"].startswith("\u201cLampVM Harness\u201d Notifications"))
+        self.assertTrue(cli.overlaps(found[0]["bounds"], {"x": 1060, "y": 108, "width": 360, "height": 332}))
+        self.assertFalse(cli.overlaps(found[0]["bounds"], {"x": 140, "y": 48, "width": 900, "height": 692}))
+        widgets_only = [e for e in items if not e["path"].startswith("0.0")]
+        self.assertEqual(cli.banners_from_tree(widgets_only), [])
 
     def test_partial_failed_copy_is_removed_and_guest_temp_is_cleaned(self):
         vm = self.vm()

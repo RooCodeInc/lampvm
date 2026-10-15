@@ -1,4 +1,5 @@
 import AppKit
+import UserNotifications
 
 // Deliberately offline and deterministic: this window exercises input and observable state changes.
 final class DragMarker: NSView {
@@ -94,10 +95,11 @@ final class DrawnButton: NSView {
     override func mouseDown(with event: NSEvent) { pressed() }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, UNUserNotificationCenterDelegate {
     var window: NSWindow!
     var notes: NSWindow!
     let approval = NSTextField(labelWithString: "Approval: waiting")
+    let banner = NSTextField(labelWithString: "Banner: none")
     var clicks = 0
     let clickStatus = NSTextField(labelWithString: "Clicks: 0")
     let textStatus = NSTextField(labelWithString: "Typed: empty")
@@ -190,10 +192,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         let heading = NSTextField(labelWithString: "Second window"); heading.frame = NSRect(x: 24, y: 250, width: 300, height: 24)
         let drawn = DrawnButton(frame: NSRect(x: 24, y: 150, width: 160, height: 48)); drawn.pressed = { [weak self] in self?.approval.stringValue = "Approval: approved" }
         approval.frame = NSRect(x: 24, y: 100, width: 300, height: 24)
-        for view in [heading, drawn, approval] { notes.contentView!.addSubview(view) }
+        // A real Notification Center banner with made-up text, for checks that captures refuse what a banner covers.
+        let post = NSButton(title: "Post Banner", target: self, action: #selector(postBanner)); post.frame = NSRect(x: 24, y: 50, width: 160, height: 32)
+        banner.frame = NSRect(x: 24, y: 20, width: 320, height: 24)
+        for view in [heading, drawn, approval, post, banner] { notes.contentView!.addSubview(view) }
         notes.orderFront(nil)
         window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
     }
+    @objc func postBanner() {
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        center.requestAuthorization(options: [.alert]) { granted, _ in
+            guard granted else { DispatchQueue.main.async { self.banner.stringValue = "Banner: not allowed" }; return }
+            let content = UNMutableNotificationContent()
+            content.title = "Made-up banner"; content.body = "Made-up private text in a notification"
+            center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)) { error in
+                DispatchQueue.main.async { self.banner.stringValue = error == nil ? "Banner: posted" : "Banner: failed" }
+            }
+        }
+    }
+    // macOS shows no banner for the app in front unless it asks for one.
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) { completionHandler([.banner, .list]) }
     @objc func clicked() { clicks += 1; clickStatus.stringValue = "Clicks: \(clicks)" }
     func controlTextDidChange(_ obj: Notification) { textStatus.stringValue = "Typed: \(text.stringValue.isEmpty ? "empty" : text.stringValue)" }
     @objc func reveal() {

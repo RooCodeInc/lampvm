@@ -1,0 +1,253 @@
+[
+ {
+  "label": "Notification Center",
+  "path": "0",
+  "role": "AXApplication"
+ },
+ {
+  "bounds": {
+   "height": 900,
+   "width": 1440,
+   "x": 0,
+   "y": 0
+  },
+  "label": "Notification Center",
+  "path": "0.0",
+  "role": "AXWindow"
+ },
+ {
+  "bounds": {
+   "height": 900,
+   "width": 1440,
+   "x": 0,
+   "y": 0
+  },
+  "label": "",
+  "path": "0.0.0",
+  "role": "AXGroup"
+ },
+ {
+  "bounds": {
+   "height": 804,
+   "width": 752,
+   "x": 688,
+   "y": 0
+  },
+  "enabled": true,
+  "label": "",
+  "path": "0.0.0.0",
+  "role": "AXGroup"
+ },
+ {
+  "bounds": {
+   "height": 804,
+   "width": 752,
+   "x": 688,
+   "y": 0
+  },
+  "label": "",
+  "path": "0.0.0.0.0",
+  "role": "AXScrollArea"
+ },
+ {
+  "bounds": {
+   "height": 73,
+   "width": 344,
+   "x": 1080,
+   "y": 46
+  },
+  "enabled": true,
+  "label": "“LampVM Harness” Notifications, Notifications may include alerts, sounds, and icon badges. | 003D9CD3-D7B1-4FE7-A3C2-6F1F220939C7",
+  "path": "0.0.0.0.0.0",
+  "role": "AXGroup"
+ },
+ {
+  "bounds": {
+   "height": 16,
+   "width": 208,
+   "x": 1138,
+   "y": 58
+  },
+  "enabled": true,
+  "label": "“LampVM Harness” Notifications | title",
+  "path": "0.0.0.0.0.0.0",
+  "role": "AXStaticText",
+  "value": "“LampVM Harness” Notifications"
+ },
+ {
+  "bounds": {
+   "height": 32,
+   "width": 274,
+   "x": 1138,
+   "y": 74
+  },
+  "enabled": true,
+  "label": "Notifications may include alerts, sounds, and icon badges. | body",
+  "path": "0.0.0.0.0.0.1",
+  "role": "AXStaticText",
+  "value": "Notifications may include alerts, sounds, and icon badges."
+ },
+ {
+  "bounds": {
+   "height": 0,
+   "width": 0,
+   "x": 720,
+   "y": 450
+  },
+  "enabled": true,
+  "label": "widgets-overlay-view",
+  "path": "0.0.0.0.1",
+  "role": "AXGroup"
+ },
+ {
+  "bounds": {
+   "height": 180,
+   "width": 360,
+   "x": 8,
+   "y": 218
+  },
+  "label": "Featured",
+  "path": "0.1",
+  "role": "AXWindow"
+ },
+ {
+  "bounds": {
+   "height": 180,
+   "width": 360,
+   "x": 8,
+   "y": 218
+  },
+  "label": "",
+  "path": "0.1.0",
+  "role": "AXGroup"
+ },
+ {
+  "bounds": {
+   "height": 164,
+   "width": 344,
+   "x": 16,
+   "y": 226
+  },
+  "enabled": true,
+  "label": "Photos | widget-local:com.apple.Photos:com.apple.Photos.PhotosReliveWidget:com.apple.Photos.PhotosReliveWidget",
+  "path": "0.1.0.0",
+  "role": "AXGroup"
+ },
+ {
+  "bounds": {
+   "height": 64,
+   "width": 64,
+   "x": 156,
+   "y": 261
+  },
+  "enabled": true,
+  "label": "ContentUnavailablePhotosIcon",
+  "path": "0.1.0.0.0",
+  "role": "AXImage"
+ },
+ {
+  "bounds": {
+   "height": 26,
+   "width": 211,
+   "x": 82.5,
+   "y": 329
+  },
+  "enabled": true,
+  "label": "Photos will appear here when they are finished processing",
+  "path": "0.1.0.0.1",
+  "role": "AXStaticText",
+  "value": "Photos will appear here when they are finished processing"
+ },
+ {
+  "bounds": {
+   "height": 180,
+   "width": 180,
+   "x": 188,
+   "y": 38
+  },
+  "label": "Forecast",
+  "path": "0.2",
+  "role": "AXWindow"
+ },
+ {
+  "bounds": {
+   "height": 180,
+   "width": 180,
+   "x": 188,
+   "y": 38
+  },
+  "label": "",
+  "path": "0.2.0",
+  "role": "AXGroup"
+ },
+ {
+  "bounds": {
+   "height": 164,
+   "width": 164,
+   "x": 196,
+   "y": 46
+  },
+  "enabled": true,
+  "label": "Weather | widget-local:com.apple.weather:com.apple.weather.widget:com.apple.weather",
+  "path": "0.2.0.0",
+  "role": "AXGroup"
+ },
+ {
+  "bounds": {
+   "height": 128,
+   "width": 89,
+   "x": 214,
+   "y": 64
+  },
+  "enabled": true,
+  "label": "Bogotá, 51° Fahrenheit, Mostly Cloudy, High of 67° Fahrenheit, Low of 51° Fahrenheit",
+  "path": "0.2.0.0.0",
+  "role": "AXUnknown"
+ },
+ {
+  "bounds": {
+   "height": 180,
+   "width": 180,
+   "x": 8,
+   "y": 38
+  },
+  "label": "Month",
+  "path": "0.3",
+  "role": "AXWindow"
+ },
+ {
+  "bounds": {
+   "height": 180,
+   "width": 180,
+   "x": 8,
+   "y": 38
+  },
+  "label": "",
+  "path": "0.3.0",
+  "role": "AXGroup"
+ },
+ {
+  "bounds": {
+   "height": 164,
+   "width": 164,
+   "x": 16,
+   "y": 46
+  },
+  "enabled": true,
+  "label": "Calendar | widget-local:com.apple.iCal:com.apple.iCal.CalendarWidgetExtension:com.apple.CalendarWidget.CalendarMonthWidget",
+  "path": "0.3.0.0",
+  "role": "AXGroup"
+ },
+ {
+  "bounds": {
+   "height": 128,
+   "width": 138,
+   "x": 29,
+   "y": 64
+  },
+  "enabled": true,
+  "label": "THURSDAY, OCTOBER 15 | month-view-current-date",
+  "path": "0.3.0.0.0",
+  "role": "AXUnknown"
+ }
+]

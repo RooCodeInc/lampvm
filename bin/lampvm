@@ -102,6 +102,22 @@ def prompt_from_tree(tree):
     return {"text": text, "buttons": buttons} if tree.startswith("AXWindow") else None
 
 
+def banners_from_tree(items):
+    # Notification Center has a window titled "Notification Center" only while a notification, or its panel, shows.
+    # Each notification is a labelled group in it; failing that, its text; failing that, the whole window counts.
+    found = []
+    for window in [e for e in items if e["role"] == "AXWindow" and e["label"] == "Notification Center" and e.get("bounds")]:
+        inside = [e for e in items if e["path"].startswith(window["path"] + ".") and e.get("bounds") and e["bounds"]["width"] > 0]
+        cells = [e for e in inside if e["role"] == "AXGroup" and e["label"] and e["label"] != "widgets-overlay-view"]
+        texts = [e for e in inside if e["role"] in ("AXStaticText", "AXButton", "AXImage")]
+        found += [{"bounds": e["bounds"], "text": e["label"].split(" | ")[0]} for e in cells or texts] or [{"bounds": window["bounds"], "text": "a notification"}]
+    return found
+
+
+def overlaps(a, b):
+    return a["x"] < b["x"] + b["width"] and b["x"] < a["x"] + a["width"] and a["y"] < b["y"] + b["height"] and b["y"] < a["y"] + a["height"]
+
+
 def ocr_target(lines, text, exact=False, index=None, scale=2.0, area="the screen"):
     # OCR boxes are in image pixels; the click point is in screen points from the captured area's corner.
     wanted = text.lower()
@@ -584,17 +600,44 @@ class VM:
         raised = self.helper_version() >= 5
         shown = json.loads(self.control(*(["raise", window["key"], window["title"]] if raised else ["activate", window["key"]]), capture=True))
         # Some windows, such as desktop widgets, cannot come forward. A capture of one that another app covers would
-        # show that app, so look at five points inside it.
+        # show that app. Helper 5 lists the windows on screen front to back, which finds any overlap; an older one can
+        # only look at five points inside the window, and misses a cover that falls between them.
         x, y, width, height = map(int, window["bounds"].split(","))
-        points = [(x + width * fx, y + height * fy) for fx, fy in ((0.5, 0.5), (0.15, 0.15), (0.85, 0.15), (0.15, 0.85), (0.85, 0.85))]
-        script = 'h="$HOME/.local/bin/vmctl"; while (( $# )); do "$h" hit "$1" "$2" 2>/dev/null || print "{}"; shift 2; done'
-        hits = [json.loads(line) for line in self.gout("/bin/zsh", "-c", script, "lampvm", *["%.0f" % v for point in points for v in point]).splitlines()]
-        covering = {hit["pid"] for hit in hits if hit.get("hit") and hit.get("pid", -1) > 0} - {shown["pid"]}
+        if raised:
+            stack = json.loads(self.control("onscreen", capture=True))
+            target = next((i for i, w in enumerate(stack) if w["pid"] == shown["pid"] and w["title"] == window["title"]), None)
+            if target is None:
+                raise Error("The window %r is not on screen" % window["title"])
+            # The menu bar, Dock and notification layers (20 and up) span the screen though they draw little of it;
+            # notification banners are checked on their own.
+            covering = {w["pid"] for w in stack[:target] if w["pid"] != shown["pid"] and w["layer"] < 20 and w["alpha"] > 0
+                        and overlaps(w["bounds"], {"x": x, "y": y, "width": width, "height": height})}
+        else:
+            points = [(x + width * fx, y + height * fy) for fx, fy in ((0.5, 0.5), (0.15, 0.15), (0.85, 0.15), (0.15, 0.85), (0.85, 0.85))]
+            script = 'h="$HOME/.local/bin/vmctl"; while (( $# )); do "$h" hit "$1" "$2" 2>/dev/null || print "{}"; shift 2; done'
+            hits = [json.loads(line) for line in self.gout("/bin/zsh", "-c", script, "lampvm", *["%.0f" % v for point in points for v in point]).splitlines()]
+            covering = {hit["pid"] for hit in hits if hit.get("hit") and hit.get("pid", -1) > 0} - {shown["pid"]}
         if covering:
             names = [a["name"] for a in json.loads(self.control("apps", capture=True)) if a["pid"] in covering] or ["another window"]
             raise Error("The window %r is covered by %s, so a capture would show that instead. Move or close it, then retry." %
                         (window["title"], ", ".join(names)))
         return raised
+
+    def banners(self):
+        try:
+            result = subprocess.run([str(self.tart), "exec", self.name, self.helper(), "tree", "com.apple.notificationcenterui", "--json"],
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=20)
+        except subprocess.TimeoutExpired:
+            raise Error("Could not read Notification Center to rule out a notification banner over the capture; retry")
+        return banners_from_tree(json.loads(result.stdout)) if result.returncode == 0 else []  # Not running: nothing shows.
+
+    def refuse_banners(self, region):
+        # A banner over the captured area would put its text, often private, into the picture.
+        area = dict(zip(("x", "y", "width", "height"), map(int, region.split(",")))) if region else None
+        shown = [b for b in self.banners() if area is None or overlaps(b["bounds"], area)]
+        if shown:
+            raise Error("A notification is on screen over the capture area (%s), so the capture would show it. Wait for it to go, or dismiss it "
+                        "(a person can through `lampvm view`), then retry." % "; ".join(repr(b["text"][:80]) for b in shown))
 
     def ocr_click(self, app, text, args):
         # For what Accessibility cannot see, such as a web page's own buttons: read the screen and click the words.
@@ -665,6 +708,9 @@ class VM:
                 if not re.fullmatch(r"-?\d+,-?\d+,\d+,\d+", bounds):
                     raise Error("Invalid app window bounds: " + bounds)
                 command += ["--region", bounds] if own else ["-R" + bounds]
+        # Helper 5 leaves Notification Center out of recordings, so a banner, even one arriving mid-take, is never filmed.
+        if not (video and version >= 5):
+            self.refuse_banners(bounds if app or window else None)
         if not own:
             command += (["-v", "-V" + str(args.seconds), "-k"] if video else []) + [remote]
         partial = destination.with_name(destination.name + "." + ident + ".partial")

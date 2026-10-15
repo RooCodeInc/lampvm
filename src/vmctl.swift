@@ -59,7 +59,9 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
                 input.expectsMediaDataInRealTime = true; writer.add(input)
                 guard writer.startWriting() else { fail("cannot write \(self.url.path): \(writer.error?.localizedDescription ?? "unknown error")") }
                 self.writer = writer; self.input = input
-                let stream = SCStream(filter: SCContentFilter(display: display, excludingWindows: []), configuration: configuration, delegate: self)
+                // Notification Center is left out, so a banner never shows in a take, nor do desktop widgets.
+                let hidden = content.applications.filter { $0.bundleIdentifier == "com.apple.notificationcenterui" }
+                let stream = SCStream(filter: SCContentFilter(display: display, excludingApplications: hidden, exceptingWindows: []), configuration: configuration, delegate: self)
                 try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: self.queue)
                 self.stream = stream
                 stream.startCapture { error in
@@ -438,6 +440,15 @@ case "raise":
     AXUIElementSetAttributeValue(window,kAXMainAttribute as CFString,kCFBooleanTrue)
     let raised = AXUIElementPerformAction(window,kAXRaiseAction as CFString) == .success
     pause(0.2); json(["raised":raised,"title":args[2],"pid":application.processIdentifier])
+// The windows on screen, front to back, as the window server stacks them: what a capture of an area will show.
+case "onscreen":
+    let list = (CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]]) ?? []
+    json(list.compactMap { info -> [String: Any]? in
+        guard let bounds = info[kCGWindowBounds as String] as? NSDictionary, let rect = CGRect(dictionaryRepresentation: bounds) else { return nil }
+        return ["pid": info[kCGWindowOwnerPID as String] as? Int ?? -1, "owner": info[kCGWindowOwnerName as String] as? String ?? "",
+                "title": info[kCGWindowName as String] as? String ?? "", "layer": info[kCGWindowLayer as String] as? Int ?? 0,
+                "alpha": info[kCGWindowAlpha as String] as? Double ?? 1, "bounds": rectJSON(rect)]
+    })
 case "activate": require(2,"activate APP"); trusted(); let application = app(args[1]); activate(application); json(["frontmost":true,"pid":application.processIdentifier])
 case "quit":
     require(2,"quit APP")
@@ -555,7 +566,8 @@ case "record":
     recorder.start(region: region) { DispatchQueue.main.asyncAfter(deadline: .now() + limit, execute: stop) }
     dispatchMain()
 // What this helper can do, for a host newer or older than it: 2 added --glide, 3 added record,
-// 4 added pause and resume and lifted the limit from 300 to 3600 seconds, 5 added raise.
+// 4 added pause and resume and lifted the limit from 300 to 3600 seconds, 5 added raise and onscreen and
+// leaves Notification Center out of recordings.
 case "version": print(5)
 default:
     fail("usage: vmctl click|doubleclick|rightclick X Y | move X Y | hit X Y | scroll X Y DY [DX] | drag X1 Y1 X2 Y2 [SECONDS] | type TEXT | key NAME [mods] | activate|quit APP | tree APP [--json] | find|clickon|press APP TEXT | wait|assert APP TEXT [--absent] [--timeout SEC] | setvalue APP TEXT VALUE | bounds|windows APP | apps | ocr IMAGE_PATH | trusted [--prompt] | display [WIDTH HEIGHT]")
