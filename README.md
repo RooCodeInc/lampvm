@@ -232,6 +232,7 @@ Global selection: `--name NAME`, `--config FILE`, `--state-dir DIRECTORY`. Envir
 | `launch [APP] [ARGS…]` | Opens an app, passing optional launch arguments. |
 | `quit [APP]` | Requests that an app quit. |
 | `activate [APP]` | Brings the app forward. |
+| `openrouter [APP] [--model ID]` | Lamp only: quits the app, copies just the `openrouter` entry of the host's `Lamp Dev/keys.json` into the guest app's `keys.json` (mode 600, sent on standard input) and sets the app to build with pi on OpenRouter using the configured test model, `anthropic/claude-sonnet-5.5`. APP is `Lamp Dev` unless given. |
 | `wipe --yes` | Quits the configured app and clears only explicitly configured preference domains/data paths. It does not erase the guest or Keychain. |
 | `tree [APP] [--json]` | Reads the app's Accessibility tree: roles, frames, labels and values. |
 | `find [APP] TEXT [--json] [--exact] [--role ROLE]` | Finds labelled Accessibility elements; role restricts matches (for example `AXButton`). |
@@ -269,6 +270,18 @@ An opt-in Lamp example is provided in `config/lamp.json`. Its bundle ID, prefere
 ```sh
 bin/lampvm --config config/lamp.json --name test-my-session launch
 ```
+
+### Live AI turns in Lamp
+
+Real turns are paid from the host owner's OpenRouter key, so VM tests build with Sonnet 5.5, not Lamp's own default (Opus 5.5). After installing a source build, run `openrouter` instead of writing the key or model settings by hand; it also completes onboarding:
+
+```sh
+bin/lampvm --config config/lamp.json install "build/Lamp Dev.app"
+bin/lampvm --config config/lamp.json openrouter
+bin/lampvm --config config/lamp.json launch "Lamp Dev"
+```
+
+The model comes from `openrouter.model` in `config/lamp.json`; pass `--model ID` only when a test needs another. Lamp has no thinking setting of its own: pi starts at its default level, `medium`, which each turn's pi session file (`Apps/APP/.lamp/pi-sessions/*.jsonl` in the guest's `Lamp Dev` folder) records beside the model. Check those lines when a run's cost matters.
 
 ## Limits and security
 

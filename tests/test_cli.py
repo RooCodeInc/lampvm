@@ -156,6 +156,32 @@ class CLISafetyTests(IsolatedState, unittest.TestCase):
             (self.state / "config.json").write_text('{"app": null}\n')
             self.assertEqual(app(), "FromEnvironment")
 
+    def test_openrouter_sends_only_its_key_on_stdin_and_the_configured_model(self):
+        keys = self.state / "keys.json"
+        keys.write_text(json.dumps({"openrouter": "sk-or-test-secret", "anthropic": "sk-ant-other"}))
+        config = json.loads((ROOT / "config/lamp.json").read_text())
+        config["openrouter"]["keys"] = str(keys)
+        (self.state / "config.json").write_text(json.dumps(config))
+        vm = self.vm()
+        with mock.patch.object(vm, "need"), mock.patch.object(vm, "control") as control, mock.patch.object(vm, "t") as tart:
+            self.invoke(["openrouter"], vm)
+        control.assert_called_once_with("quit", "Lamp Dev")
+        argv, options = tart.call_args.args, tart.call_args.kwargs
+        self.assertEqual(argv[-3:], ("Lamp Dev", "dev.lamp.host.dev", "anthropic/claude-sonnet-5.5"))
+        self.assertNotIn("sk-or-test-secret", " ".join(argv))
+        self.assertEqual(json.loads(options["input"]), {"openrouter": "sk-or-test-secret"})
+
+    def test_openrouter_without_a_key_pushes_nothing(self):
+        config = json.loads((ROOT / "config/lamp.json").read_text())
+        config["openrouter"]["keys"] = str(self.state / "missing.json")
+        (self.state / "config.json").write_text(json.dumps(config))
+        vm = self.vm()
+        with mock.patch.object(vm, "need"), mock.patch.object(vm, "control") as control, mock.patch.object(vm, "t") as tart:
+            with self.assertRaisesRegex(cli.Error, "No openrouter key"):
+                self.invoke(["openrouter"], vm)
+        control.assert_not_called()
+        tart.assert_not_called()
+
     def test_no_app_specific_default(self):
         vm = self.vm()
         with self.assertRaisesRegex(cli.Error, "Specify APP"):

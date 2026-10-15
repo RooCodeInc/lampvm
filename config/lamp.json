@@ -8,5 +8,10 @@
       "Applications/Lamp Apps",
       "Applications/Forge Apps"
     ]
+  },
+  "openrouter": {
+    "model": "anthropic/claude-sonnet-5.5",
+    "keys": "~/Library/Application Support/Lamp Dev/keys.json",
+    "apps": {"Lamp Dev": "dev.lamp.host.dev", "Lamp": "dev.lamp.host"}
   }
 }

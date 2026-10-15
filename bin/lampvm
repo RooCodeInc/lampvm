@@ -297,6 +297,39 @@ class VM:
             handle.close()
         return None if handle else "recording"
 
+    def openrouter(self, app=None, model=None):
+        # Live AI turns cost real money on the person's key, so the configured model is the
+        # one every session gets unless it names another. Only the openrouter entry leaves the
+        # host, through standard input: never in an argument, a host temp file or the output.
+        setting = self.config.get("openrouter", {})
+        apps = setting.get("apps", {})
+        app = app or next(iter(apps), None)
+        if app not in apps or not re.fullmatch(r"[A-Za-z0-9._-]+", apps[app]):
+            raise Error("No openrouter preference domain configured for app: %s" % app)
+        model = model or setting.get("model")
+        if not model or not re.fullmatch(r"[A-Za-z0-9._:/-]+", model):
+            raise Error("Configure openrouter.model or pass --model as a provider/model id")
+        keys = Path(setting.get("keys") or "~/Library/Application Support/Lamp Dev/keys.json").expanduser()
+        try:
+            key = json.loads(keys.read_text()).get("openrouter")
+        except (OSError, ValueError, AttributeError):
+            key = None
+        if not isinstance(key, str) or not key.strip():
+            raise Error("No openrouter key in %s; nothing pushed" % keys)
+        self.control("quit", app)
+        script = '''set -eu
+umask 077
+mkdir -p -- "$HOME/Library/Application Support/$1"
+/bin/cat > "$HOME/Library/Application Support/$1/keys.json"
+/usr/bin/defaults write "$2" onboarded -bool true
+/usr/bin/defaults write "$2" engine pi
+/usr/bin/defaults write "$2" piProvider openrouter
+/usr/bin/defaults write "$2" piModel.openrouter "$3"
+'''
+        self.t("exec", "-i", self.name, "/bin/zsh", "-c", script, "lampvm", app, apps[app], model,
+               input=json.dumps({"openrouter": key.strip()}), text=True)
+        print("%s builds with openrouter %s" % (app, model))
+
     def application(self, explicit=None):
         app = explicit or self.app
         if not app:
@@ -838,6 +871,9 @@ def parser():
     q.add_argument("args", nargs=argparse.REMAINDER)
     q = add("quit", "ask an app to quit")
     q.add_argument("app", nargs="?")
+    q = add("openrouter", "give the guest's Lamp the host's OpenRouter key and the configured test model")
+    q.add_argument("app", nargs="?", help="configured app; defaults to the first, Lamp Dev")
+    q.add_argument("--model", help="provider/model id instead of the configured one")
     q = add("wipe", "clear only paths and domains configured for this app")
     q.add_argument("--yes", action="store_true", required=True)
     for name in ["shot", "record"]:
@@ -1106,6 +1142,8 @@ mv -- "$staging/new/$1" /Applications/
                 vm.guest(*argv)
             elif cmd == "quit":
                 vm.control("quit", vm.application(args.app))
+            elif cmd == "openrouter":
+                vm.openrouter(args.app, args.model)
             elif cmd == "wipe":
                 wipe = vm.config.get("wipe", {})
                 domains, paths = wipe.get("preference_domains", []), wipe.get("paths", [])
