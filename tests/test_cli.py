@@ -335,6 +335,35 @@ class CaptureSafetyTests(IsolatedState, unittest.TestCase):
             with self.assertRaisesRegex(cli.Error, "cannot end a recording early"):
                 vm.signal_recording("stop")
 
+    def test_mark_reaches_only_a_helper_that_keeps_marks_and_lands_beside_the_movie(self):
+        # Seen in a real guest on 2026-10-20: helper 6 reports marks, and the record call wrote them to take.timeline.json.
+        vm = self.vm()
+        vm.ctl = "/Users/admin/.local/bin/vmctl"
+        with mock.patch.object(vm, "need"), mock.patch.object(vm, "recordings", return_value=[]), mock.patch.object(vm, "control") as control:
+            with self.assertRaisesRegex(cli.Error, "No recording is running"):
+                vm.mark_recording("first mark")
+        control.assert_not_called()
+        with mock.patch.object(vm, "need"), mock.patch.object(vm, "recordings", return_value=[{"vm": vm.name}]), \
+             mock.patch.object(vm, "helper_version", return_value=5), mock.patch.object(vm, "control") as control:
+            with self.assertRaisesRegex(cli.Error, "cannot mark"):
+                vm.mark_recording("first mark")
+        control.assert_not_called()
+        with mock.patch.object(vm, "need"), mock.patch.object(vm, "recordings", return_value=[{"vm": vm.name}]), \
+             mock.patch.object(vm, "helper_version", return_value=6), mock.patch.object(vm, "control") as control:
+            vm.mark_recording("  first\nmark ")
+        control.assert_called_once_with("mark", "first mark")
+        movie = self.state / "take.mov"
+        def capture(*arguments, **kwargs):
+            self.fake_capture(*arguments, **kwargs)
+            return mock.Mock(stdout='{"file":"x","frames":3,"seconds":8.44,"pausedSeconds":0,"marks":[{"seconds":3.07,"text":"first mark"},{"seconds":6.11,"text":"second mark"}]}')
+        with mock.patch.object(vm, "need"), mock.patch.object(vm, "guest", side_effect=capture), mock.patch.object(vm, "helper_version", return_value=6), \
+             mock.patch.object(cli.subprocess, "run"), contextlib.redirect_stdout(io.StringIO()) as out:
+            vm.artifact(self.artifact_args(str(movie)), True)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["timeline"], str(self.state / "take.timeline.json"))
+        self.assertEqual(json.loads((self.state / "take.timeline.json").read_text()), report["marks"])
+        self.assertEqual([m["text"] for m in report["marks"]], ["first mark", "second mark"])
+
     def test_pause_never_signals_a_helper_that_a_user_signal_would_kill(self):
         # A helper before 4 has no handler for SIGUSR1, so it would end without saving the movie.
         vm = self.vm()

@@ -33,6 +33,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     var stream: SCStream?, writer: AVAssetWriter?, input: AVAssetWriterInput?
     var first = CMTime.invalid, frames = 0, latest: CMSampleBuffer?
     var pausedAt: CMTime?, resumedAt = CMTime.invalid, skipped = CMTime.zero, unseen: CMSampleBuffer?
+    var pauses: [(CMTime, CMTime)] = []  // Each pause's start and end on the host clock, for placing marks.
     let frame = CMTime(value: 1, timescale: 60)
     init(url: URL) { self.url = url }
     func start(region: CGRect?, started: @escaping () -> Void) {
@@ -105,12 +106,27 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
                 // The screen may have changed while paused and stay still afterwards, so go on from how it looks now.
                 if let unseen = self.unseen, self.write(unseen, at: CMTimeSubtract(pausedAt, self.skipped)) { self.frames += 1 }
                 self.skipped = CMTimeAdd(self.skipped, CMTimeSubtract(now, pausedAt))
+                self.pauses.append((pausedAt, now))
                 self.pausedAt = nil; self.unseen = nil; self.resumedAt = now
             }
         }
     }
     func stream(_ stream: SCStream, didStopWithError error: Error) { fail("recording stopped: \(error.localizedDescription)") }
-    func finish(_ done: @escaping (Double, Int, Double) -> Void) {
+    static let marksFile = "/tmp/lampvm-record-marks"
+    // Marks made while this take ran, in seconds of the movie: paused time before a mark is left out, as its frames were.
+    func marks(until end: CMTime, paused: [(CMTime, CMTime)]) -> [[String: Any]] {
+        guard let text = try? String(contentsOfFile: Self.marksFile, encoding: .utf8) else { return [] }
+        return text.split(separator: "\n").compactMap { line in
+            let parts = line.split(separator: "\t", maxSplits: 1)
+            guard parts.count == 2, let seconds = Double(parts[0]) else { return nil }
+            let at = CMTime(seconds: seconds, preferredTimescale: 1_000_000_000)
+            // A mark made in the moment before the first frame arrived belongs to the start of the movie.
+            guard CMTimeCompare(at, CMTimeSubtract(first, CMTime(seconds: 3, preferredTimescale: 1))) >= 0, CMTimeCompare(at, end) <= 0 else { return nil }
+            let skipped = paused.reduce(0.0) { sum, pause in sum + max(0, CMTimeGetSeconds(CMTimeSubtract(CMTimeMinimum(at, pause.1), pause.0))) }
+            return ["seconds": (max(0, CMTimeGetSeconds(CMTimeSubtract(at, first)) - skipped) * 100).rounded() / 100, "text": String(parts[1])]
+        }
+    }
+    func finish(_ done: @escaping (Double, Int, Double, [[String: Any]]) -> Void) {
         // Frame times are on the host clock, so the last frame is held until now, or until the pause it was stopped in.
         // Read on the recording queue, after any pause or resume asked for before stopping.
         queue.async {
@@ -123,11 +139,12 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
                     }
                     let paused = CMTimeAdd(self.skipped, self.pausedAt.map { CMTimeSubtract(now, $0) } ?? .zero)
                     let end = CMTimeSubtract(now, paused)
+                    let marks = self.marks(until: now, paused: self.pauses + (self.pausedAt.map { [($0, now)] } ?? []))
                     self.hold(until: end)
                     input.markAsFinished(); writer.endSession(atSourceTime: end)
                     writer.finishWriting {
                         guard writer.status == .completed else { fail("cannot finish the movie: \(writer.error?.localizedDescription ?? "unknown error")") }
-                        done(CMTimeGetSeconds(CMTimeSubtract(end, self.first)), self.frames, CMTimeGetSeconds(paused))
+                        done(CMTimeGetSeconds(CMTimeSubtract(end, self.first)), self.frames, CMTimeGetSeconds(paused), marks)
                     }
                 }
             }
@@ -146,7 +163,7 @@ let optionArguments: [String] = {
     let command = args.first ?? ""
     let required = ["click":3,"doubleclick":3,"rightclick":3,"move":3,"hit":3,"scroll":4,"drag":5,
                     "type":2,"key":2,"activate":2,"quit":2,"tree":2,"find":3,"clickon":3,"press":3,
-                    "setvalue":4,"wait":3,"assert":3,"bounds":2,"windows":2,"raise":3,"ocr":2,"record":2]
+                    "setvalue":4,"wait":3,"assert":3,"bounds":2,"windows":2,"raise":3,"ocr":2,"record":2,"mark":2]
     var start = required[command] ?? 1
     if let count = required[command], args.count < count { fail("not enough arguments for \(command); run vmctl without arguments for usage") }
     if ["scroll","drag","key"].contains(command), args.count > start, !args[start].hasPrefix("--") { start += 1 }
@@ -538,6 +555,13 @@ case "ocr": require(2,"ocr IMAGE_PATH"); recognize(args[1])
 case "trusted":
     let value = has("--prompt") ? AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String:true] as CFDictionary) : AXIsProcessTrusted()
     print(value ? "yes" : "no"); exit(value ? 0 : 1)
+case "mark":
+    // Names this moment for the running recordings: the recorder reads these when it finishes, on its own clock.
+    require(2,"mark TEXT")
+    let line = String(format: "%.3f\t%@\n", CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock())), args[1].replacingOccurrences(of: "\n", with: " "))
+    guard let handle = FileHandle(forWritingAtPath: Recorder.marksFile) ?? (FileManager.default.createFile(atPath: Recorder.marksFile, contents: nil) ? FileHandle(forWritingAtPath: Recorder.marksFile) : nil) else { fail("cannot write \(Recorder.marksFile)") }
+    handle.seekToEndOfFile(); handle.write(Data(line.utf8)); handle.closeFile()
+    json(["mark": args[1]])
 case "record":
     require(2,"record FILE [--seconds N] [--region X,Y,W,H]")
     guard let limit = Double(option("--seconds") ?? "3600"), limit >= 1, limit <= 3600 else { fail("record duration must be 1…3600 seconds") }
@@ -551,7 +575,7 @@ case "record":
     var stopping = false
     let stop = {
         if stopping { return }; stopping = true
-        recorder.finish { seconds, frames, paused in json(["file":args[1],"seconds":seconds,"frames":frames,"pausedSeconds":paused]); exit(0) }
+        recorder.finish { seconds, frames, paused, marks in json(["file":args[1],"seconds":seconds,"frames":frames,"pausedSeconds":paused,"marks":marks]); exit(0) }
     }
     // An interrupt or the time limit ends the take; either way the movie is closed before exiting.
     // The time limit counts paused time too. SIGUSR1 pauses while the pause file exists and resumes once it is gone:
@@ -567,8 +591,8 @@ case "record":
     dispatchMain()
 // What this helper can do, for a host newer or older than it: 2 added --glide, 3 added record,
 // 4 added pause and resume and lifted the limit from 300 to 3600 seconds, 5 added raise and onscreen and
-// leaves Notification Center out of recordings.
-case "version": print(5)
+// leaves Notification Center out of recordings, 6 added mark and reports marks with a finished recording.
+case "version": print(6)
 default:
-    fail("usage: vmctl click|doubleclick|rightclick X Y | move X Y | hit X Y | scroll X Y DY [DX] | drag X1 Y1 X2 Y2 [SECONDS] | type TEXT | key NAME [mods] | activate|quit APP | tree APP [--json] | find|clickon|press APP TEXT | wait|assert APP TEXT [--absent] [--timeout SEC] | setvalue APP TEXT VALUE | bounds|windows APP | apps | ocr IMAGE_PATH | trusted [--prompt] | display [WIDTH HEIGHT]")
+    fail("usage: vmctl click|doubleclick|rightclick X Y | move X Y | hit X Y | scroll X Y DY [DX] | drag X1 Y1 X2 Y2 [SECONDS] | type TEXT | key NAME [mods] | activate|quit APP | tree APP [--json] | find|clickon|press APP TEXT | wait|assert APP TEXT [--absent] [--timeout SEC] | setvalue APP TEXT VALUE | bounds|windows APP | apps | ocr IMAGE_PATH | mark TEXT | trusted [--prompt] | display [WIDTH HEIGHT]")
 }

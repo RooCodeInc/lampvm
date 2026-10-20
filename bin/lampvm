@@ -55,6 +55,11 @@ if [[ $why == asked ]]; then print -u2 "This VM's guest helper is older than --g
 exec "$helper" "$@"'''
 RECORDER = r"/vmctl record /tmp/lampvm-[0-9a-f]+\.mov( |$)"
 RECORD_LIMIT = 3600
+
+
+def timeline_for(movie):
+    # take.mov's marks live in take.timeline.json beside it.
+    return movie.with_name(movie.stem + ".timeline.json")
 PAUSE = "%%s /tmp/lampvm-record-paused && exec /usr/bin/pkill -USR1 -f %s" % shlex.quote(RECORDER)
 GLIDE = "move the pointer to the target smoothly; always on while this VM is being recorded"
 
@@ -283,6 +288,18 @@ class VM:
             raise Error("This VM's guest helper cannot end a recording early; it runs for its --seconds. Clone a VM from a clean image prepared with the current helper.")
         else:
             raise Error("No recording is running in this VM")
+
+    def mark_recording(self, text):
+        # The helper notes the moment on the guest's own clock, the one its frames are timed by, so the mark lands where it was made.
+        self.need()
+        text = " ".join(text.split())
+        if not text:
+            raise Error("--mark needs some words")
+        if not self.recordings(self.name):
+            raise Error("No recording is running in this VM")
+        if self.helper_version() < 6:
+            raise Error("This VM's guest helper cannot mark a recording. Clone a VM from a clean image prepared with the current helper.")
+        self.control("mark", text)
 
     def recording(self):
         (self.state / "locks").mkdir(parents=True, exist_ok=True)
@@ -778,6 +795,10 @@ mkdir -p -- "$HOME/Library/Application Support/$1"
             report["seconds"] = round(taken["seconds"], 2)
             if taken.get("pausedSeconds"):  # Left out by `record --pause`; a helper before 4 has no pauses.
                 report["pausedSeconds"] = round(taken["pausedSeconds"], 2)
+            if taken.get("marks"):  # Made by `record --mark`; a helper before 6 has none.
+                timeline = timeline_for(destination)
+                timeline.write_text(json.dumps(taken["marks"], indent=1) + "\n")
+                report["marks"], report["timeline"] = taken["marks"], str(timeline)
         words = [word.strip() for word in (getattr(args, "text_check", None) or "").split("|") if word.strip()]
         if words:
             checker = self.state / "bin/textcheck"
@@ -838,6 +859,14 @@ def parser():
     q.add_argument("--no-download", action="store_true")
     q.add_argument("--wait-slot", type=int, default=0)
     add("build", "build host and guest helpers into external state")
+    q = add("video", "cut a recording into a movie worth watching: still stretches played fast, marks drawn as captions; no VM needed")
+    q.add_argument("source", help="the recording, such as take.mov")
+    q.add_argument("file", help="the movie to write, .mp4 or .mov; must be new")
+    q.add_argument("--timeline", help="marks to caption, a JSON list of {seconds, text}; default: the recording's own, SOURCE's take.timeline.json")
+    q.add_argument("--condense", type=float, default=0, metavar="SECONDS", help="play any stretch that stands still for at least this long fast, with a badge saying how long it was; 0 keeps real time")
+    q.add_argument("--hold", type=float, default=1.0, metavar="SECONDS", help="real time kept at the start of each condensed stretch, so the viewer reads what the screen reached (default 1)")
+    q.add_argument("--crop", metavar="X,Y,W,H", help="keep only this part of the picture, in the movie's pixels (twice the points `bounds` reports on a Retina guest)")
+    q.add_argument("--width", type=int, help="scale the result to this many pixels wide; never upscales")
     add("doctor", "check host dependencies and guest permissions")
     q = add("start", "boot an owned VM headlessly; returns when it is ready for commands")
     q.add_argument("--wait", type=float, default=0, help="seconds to wait for a VM slot")
@@ -886,6 +915,7 @@ def parser():
             signals = q.add_mutually_exclusive_group()
             signals.add_argument("--stop", action="store_true", help="end this VM's running recordings now; each waiting record call then saves its movie")
             signals.add_argument("--pause", action="store_true", help="leave what happens next out of this VM's running recordings until --resume")
+            signals.add_argument("--mark", metavar="TEXT", help="name this moment in this VM's running recordings; the marks come back with the movie and `video` draws them")
             q.add_argument("--text-check", metavar="WORDS", help="afterwards, read the movie's frames and fail if any of these |-separated words show")
             signals.add_argument("--resume", action="store_true", help="carry on a paused recording; the movie goes on from the moment of pausing without a gap")
     for name in ["tree", "windows", "bounds", "activate"]:
@@ -945,6 +975,29 @@ def main():
     if cmd == "build":
         run([ROOT / "bin/build"], env={**os.environ, "LAMPVM_STATE_DIR": str(vm.state)})
         return
+    if cmd == "video":
+        editor = vm.state / "bin/videoedit"
+        if not editor.is_file():
+            raise Error("The video editor is not built; run lampvm build")
+        source = Path(args.source).expanduser()
+        if not source.is_file():
+            raise Error("No recording at " + str(source))
+        timeline = Path(args.timeline).expanduser() if args.timeline else timeline_for(source)
+        if args.timeline and not timeline.is_file():
+            raise Error("No timeline at " + str(timeline))
+        if args.crop and not re.fullmatch(r"\d+,\d+,[1-9]\d*,[1-9]\d*", args.crop):
+            raise Error("--crop needs X,Y,WIDTH,HEIGHT in pixels")
+        if args.condense < 0 or args.hold < 0 or (args.width is not None and args.width < 2):
+            raise Error("--condense and --hold are seconds, --width is pixels")
+        argv = [str(editor), str(source), str(Path(args.file).expanduser()), "--condense", str(args.condense), "--hold", str(args.hold)]
+        if timeline.is_file():
+            argv += ["--timeline", str(timeline)]
+        if args.crop:
+            argv += ["--crop", args.crop]
+        if args.width:
+            argv += ["--width", str(args.width)]
+        run(argv)
+        return
     if cmd == "setup":
         argv = [sys.executable, ROOT / "lib/setup.py", "--state-dir", vm.state, "--name", vm.name]
         if args.config:
@@ -964,7 +1017,7 @@ def main():
             problems.append("Apple Silicon is required")
         if int(checks["macos"].split(".")[0]) < 14:
             problems.append("macOS 14+ required for tart exec")
-        for tool in ["lockstate", "textcheck", "vmctl"]:
+        for tool in ["lockstate", "textcheck", "videoedit", "vmctl"]:
             if not (vm.state / "bin" / tool).is_file():
                 problems.append("missing built helper: " + tool)
         if not vm.tart.is_file():
@@ -1102,9 +1155,11 @@ def main():
             return
         vm.need()
         with Slots(vm.state).activity(vm.name, cmd):
-            if cmd == "record" and (args.stop or args.pause or args.resume) and (args.text_check is not None or args.window is not None or args.file):
-                raise Error("--stop, --pause and --resume act on the running recordings; give FILE, --window and --text-check to the record call that starts one")
-            if cmd == "record" and (args.stop or args.pause or args.resume):
+            if cmd == "record" and (args.stop or args.pause or args.resume or args.mark is not None) and (args.text_check is not None or args.window is not None or args.file):
+                raise Error("--stop, --pause, --resume and --mark act on the running recordings; give FILE, --window and --text-check to the record call that starts one")
+            if cmd == "record" and args.mark is not None:
+                vm.mark_recording(args.mark)
+            elif cmd == "record" and (args.stop or args.pause or args.resume):
                 vm.signal_recording("stop" if args.stop else "pause" if args.pause else "resume")
             elif cmd in ["shot", "record"]:
                 if cmd == "record" and not 1 <= args.seconds <= RECORD_LIMIT:
