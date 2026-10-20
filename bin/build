@@ -14,5 +14,6 @@ mkdir -p "$STATE/bin"
 HOST_VERSION="$(sw_vers -productVersion)"
 env -u MACOSX_DEPLOYMENT_TARGET xcrun swiftc -O -target "arm64-apple-macos$HOST_VERSION" "$ROOT/src/lockstate.swift" -o "$STATE/bin/lockstate"
 env -u MACOSX_DEPLOYMENT_TARGET xcrun swiftc -O -target "arm64-apple-macos$HOST_VERSION" "$ROOT/src/textcheck.swift" -o "$STATE/bin/textcheck" -suppress-warnings
+env -u MACOSX_DEPLOYMENT_TARGET xcrun swiftc -O -target "arm64-apple-macos$HOST_VERSION" "$ROOT/src/videoedit.swift" -o "$STATE/bin/videoedit" -suppress-warnings
 env -u MACOSX_DEPLOYMENT_TARGET xcrun swiftc -O -target arm64-apple-macos14 "$ROOT/src/vmctl.swift" -o "$STATE/bin/vmctl"
-print -r -- "built $STATE/bin/{lockstate,textcheck,vmctl}"
+print -r -- "built $STATE/bin/{lockstate,textcheck,videoedit,vmctl}"
