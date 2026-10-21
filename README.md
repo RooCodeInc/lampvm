@@ -203,9 +203,9 @@ $L video /tmp/flow.mov /tmp/flow.mp4 --condense 3 --crop 0,60,2880,1600 --width 
 ```
 
 - `--condense SECONDS` plays every stretch that stands still for at least that long fast, so it lasts about a second and a half, with a badge in the corner saying how long it really was ("▶▶ 48 s pass"). The first second of each stretch (`--hold`) stays at real speed, so the result the screen reached can be read. A frame counts as still while fewer than 0.3% of its pixels have moved since the stretch began, so a clock tick, a breathing line or the pointer do not break a stretch, while typing or streaming text soon does.
-- The marks from `record --mark` (the recording's own `take.timeline.json`, or `--timeline FILE`) are drawn at the foot of the picture, each from its moment to the next mark's.
+- The marks from `record --mark` (the recording's own `take.timeline.json`, or `--timeline FILE`) are drawn in a black band added under the picture, so they cover nothing, each from its moment to the next mark's. A long caption wraps to fit the movie's width; one that needs more than three lines is cut at a word with "…", and the report gives what was shown as `shown`. A movie without marks has no band.
 - `--crop X,Y,W,H` keeps one part of the picture, in the movie's pixels: twice the points `bounds` reports on a Retina guest. `--width` scales the result and never upscales.
-- The report gives the finished movie's length, each condensed stretch (where it was, how long it was, how long it plays) and each caption's time in the finished movie, so a message can list what shows when.
+- The report gives the finished movie's length and size (`height` includes the caption band, `captionBand` its height), each condensed stretch (where it was, how long it was, how long it plays) and each caption's time in the finished movie, so a message can list what shows when.
 
 Take the whole desktop or the windows that matter at their real size and crop with `video`, rather than scaling a whole desktop down to a small movie where nothing can be read.
 

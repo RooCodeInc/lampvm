@@ -3,7 +3,8 @@
 //
 // Stretches where the picture stands still for at least --condense seconds are played fast, with a badge saying how much
 // time passed; the first --hold seconds of each are kept at real speed so the viewer can read what the screen reached.
-// A timeline (the marks `record --mark` wrote) is drawn as a caption at the foot of the picture from each mark to the next.
+// A timeline (the marks `record --mark` wrote) is drawn as a caption from each mark to the next, in a band added under
+// the picture so it covers nothing; a long one wraps to three lines and is shortened with "…" past that.
 // --crop cuts to a part of the picture, in the movie's pixels; --width scales the result. Nothing needs ffmpeg.
 import AVFoundation
 import AppKit
@@ -176,21 +177,66 @@ func outTime(_ seconds: Double) -> Double {
 }
 
 func tidy(_ value: Double) -> Double { (value * 10).rounded() / 10 }
-// Captions drawn over the picture.
-let video = composition(for: edit, track: editTrack, size: renderSize, scale: scale)
-let fontSize = max(14, (renderSize.width / 60).rounded())
-func caption(_ text: String, at point: CGPoint, from: Double, to: Double, trailing: Bool = false, badge: Bool = false) -> CALayer {
-    // Drawn as a picture: a text layer draws nothing when exported this way.
+// Captions: the marks in a band under the picture, the badges over its top right corner.
+// A sixtieth of the width, at least 14, unless the movie is so narrow that 14 would leave no room for a word.
+let fontSize = max(1, min(14, (renderSize.width / 16).rounded(.down)), (renderSize.width / 60).rounded())
+let margin = fontSize * 0.9
+let pad = CGSize(width: fontSize * 0.8, height: fontSize * 0.45)
+let captionLines = 3
+// The widest text a caption may have, so that its box and the margins either side stay inside the movie.
+let textWidth = max(1, renderSize.width - margin * 2 - pad.width * 2)
+func styled(_ text: String, badge: Bool) -> NSAttributedString {
+    let paragraph = NSMutableParagraphStyle()
+    paragraph.lineBreakMode = .byWordWrapping
     let font = NSFont.systemFont(ofSize: fontSize, weight: badge ? .semibold : .medium)
-    let attributed = NSAttributedString(string: text, attributes: [.font: font, .foregroundColor: NSColor.white])
-    let textSize = attributed.size()
-    let pad = CGSize(width: fontSize * 0.8, height: fontSize * 0.45)
-    let size = CGSize(width: (textSize.width + pad.width * 2).rounded(.up), height: (textSize.height + pad.height * 2).rounded(.up))
+    return NSAttributedString(string: text, attributes: [.font: font, .foregroundColor: NSColor.white, .paragraphStyle: paragraph])
+}
+func measure(_ text: NSAttributedString) -> CGSize {
+    let box = text.boundingRect(with: CGSize(width: textWidth, height: .greatestFiniteMagnitude), options: [.usesLineFragmentOrigin, .usesFontLeading])
+    return CGSize(width: min(textWidth, box.width.rounded(.up)), height: box.height.rounded(.up))
+}
+// The text as drawn: wrapped to the width, and when it needs more than three lines, cut at a word with "…" so it takes three.
+func fitted(_ text: String, badge: Bool = false) -> (text: NSAttributedString, size: CGSize, shortened: Bool) {
+    let flat = text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+    let limit = measure(styled(Array(repeating: "Ag", count: captionLines).joined(separator: "\n"), badge: badge)).height + 1
+    let whole = styled(flat, badge: badge)
+    if measure(whole).height <= limit { return (whole, measure(whole), false) }
+    // The longest beginning that fits, found by halving: first in whole words, then in characters of the word that
+    // overflows, so a long address keeps as much of itself as the lines hold.
+    let words = flat.split(separator: " ").map(String.init)
+    func cut(_ start: String) -> NSAttributedString {
+        styled(start.trimmingCharacters(in: CharacterSet.punctuationCharacters.union(.whitespaces)) + "…", badge: badge)
+    }
+    func longest(_ count: Int, _ start: (Int) -> String) -> Int {
+        var low = 0, high = count
+        while low < high {
+            let middle = (low + high + 1) / 2
+            if measure(cut(start(middle))).height <= limit { low = middle } else { high = middle - 1 }
+        }
+        return low
+    }
+    let kept = longest(words.count - 1) { words.prefix($0).joined(separator: " ") }
+    let lead = words.prefix(kept).joined(separator: " ") + (kept > 0 ? " " : "")
+    let next = words[kept]
+    // An ordinary word is left out whole; only one as wide as half a line is cut inside.
+    let long = kept == 0 || measure(styled(next, badge: badge)).width >= textWidth / 2
+    let short = cut(lead + (long ? next.prefix(max(1, longest(next.count - 1) { lead + next.prefix($0) })) : ""))
+    return (short, measure(short), true)
+}
+// The band holds the tallest caption with a margin above and below; without marks the movie has no band.
+let fittedMarks = marks.map { fitted($0.1) }
+let band = fittedMarks.isEmpty ? 0 : ((fittedMarks.map { $0.size.height }.max()! + pad.height * 2 + margin * 2) / 2).rounded(.up) * 2
+let pictureSize = renderSize
+let movieSize = CGSize(width: pictureSize.width, height: pictureSize.height + band)
+let video = composition(for: edit, track: editTrack, size: movieSize, scale: scale)
+func caption(_ text: (text: NSAttributedString, size: CGSize, shortened: Bool), at point: CGPoint, from: Double, to: Double, trailing: Bool = false) -> CALayer {
+    // Drawn as a picture: a text layer draws nothing when exported this way.
+    let size = CGSize(width: (text.size.width + pad.width * 2).rounded(.up), height: (text.size.height + pad.height * 2).rounded(.up))
     let image = NSImage(size: size)
     image.lockFocus()
     NSColor(calibratedWhite: 0.08, alpha: 0.82).setFill()
     NSBezierPath(roundedRect: NSRect(origin: .zero, size: size), xRadius: fontSize * 0.5, yRadius: fontSize * 0.5).fill()
-    attributed.draw(at: NSPoint(x: pad.width, y: pad.height))
+    text.text.draw(with: NSRect(x: pad.width, y: pad.height, width: text.size.width + 1, height: text.size.height), options: [.usesLineFragmentOrigin, .usesFontLeading])
     image.unlockFocus()
     let pill = CALayer()
     pill.contents = image.cgImage(forProposedRect: nil, context: nil, hints: nil)
@@ -208,23 +254,31 @@ func caption(_ text: String, at point: CGPoint, from: Double, to: Double, traili
     return pill
 }
 let videoLayer = CALayer(), parent = CALayer()
-parent.frame = CGRect(origin: .zero, size: renderSize); videoLayer.frame = parent.frame
+parent.frame = CGRect(origin: .zero, size: movieSize); videoLayer.frame = parent.frame
 parent.isGeometryFlipped = true  // Top-left origin, as the picture has.
 parent.addSublayer(videoLayer)
-let margin = fontSize * 0.9
+if band > 0 {
+    // The source goes on below the crop, so the band is painted over it.
+    let strip = CALayer()
+    strip.frame = CGRect(x: 0, y: pictureSize.height, width: movieSize.width, height: band)
+    strip.backgroundColor = CGColor(gray: 0, alpha: 1)
+    parent.addSublayer(strip)
+}
 var shownMarks: [[String: Any]] = []
 for (i, mark) in marks.enumerated() {
     let from = outTime(mark.0), to = i + 1 < marks.count ? outTime(marks[i + 1].0) : outTotal
-    shownMarks.append(["seconds": tidy(from), "text": mark.1])
+    var shown: [String: Any] = ["seconds": tidy(from), "text": mark.1]
+    if fittedMarks[i].shortened { shown["shown"] = fittedMarks[i].text.string }
+    shownMarks.append(shown)
     guard to > from else { continue }
-    parent.addSublayer(caption(mark.1, at: CGPoint(x: margin, y: renderSize.height - margin - fontSize * 1.9), from: from, to: to))
+    parent.addSublayer(caption(fittedMarks[i], at: CGPoint(x: margin, y: pictureSize.height + margin), from: from, to: to))
 }
 var condensed: [[String: Any]] = []
 for (i, segment) in segments.enumerated() where segment.fast {
     let skipped = segment.to - segment.from
     let text = skipped >= 60 ? String(format: "▶▶ %d min %02d s pass", Int(skipped) / 60, Int(skipped) % 60) : String(format: "▶▶ %d s pass", Int(skipped.rounded()))
     condensed.append(["from": tidy(segment.from), "to": tidy(segment.to), "seconds": tidy(skipped), "playsFor": tidy(segment.outDuration), "at": tidy(outStarts[i])])
-    parent.addSublayer(caption(text, at: CGPoint(x: renderSize.width - margin, y: margin), from: outStarts[i], to: outStarts[i] + segment.outDuration, trailing: true, badge: true))
+    parent.addSublayer(caption(fitted(text, badge: true), at: CGPoint(x: pictureSize.width - margin, y: margin), from: outStarts[i], to: outStarts[i] + segment.outDuration, trailing: true))
 }
 video.animationTool = AVVideoCompositionCoreAnimationTool(postProcessingAsVideoLayer: videoLayer, in: parent)
 
@@ -236,6 +290,6 @@ export.exportAsynchronously { semaphore.signal() }
 semaphore.wait()
 guard export.status == .completed else { fail("export failed: \(export.error?.localizedDescription ?? "unknown error")") }
 let report: [String: Any] = ["file": output.path, "inputSeconds": tidy(total), "seconds": tidy(outTotal),
-                             "width": Int(renderSize.width), "height": Int(renderSize.height), "crop": [Int(crop.minX), Int(crop.minY), Int(crop.width), Int(crop.height)],
+                             "width": Int(movieSize.width), "height": Int(movieSize.height), "captionBand": Int(band), "crop": [Int(crop.minX), Int(crop.minY), Int(crop.width), Int(crop.height)],
                              "condensed": condensed, "marks": shownMarks]
 print(String(data: try! JSONSerialization.data(withJSONObject: report, options: [.sortedKeys]), encoding: .utf8)!)
