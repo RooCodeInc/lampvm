@@ -1,0 +1,9 @@
+{
+  "image": {
+    "name": "lampvm-xcode27",
+    "from": "ghcr.io/cirruslabs/macos-tahoe-xcode@sha256:71d9dc1d6c4614b7ecbb328753124912b43425fc8cf1c4085d7f352026df6601"
+  },
+  "ready": [
+    {"exec": ["/usr/bin/xcodebuild", "-version"], "expect": "Xcode 27"}
+  ]
+}

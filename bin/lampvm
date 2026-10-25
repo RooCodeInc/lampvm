@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
 from bootstrap import complete_desktop
 from slots import Slots, flock_file
+import vmspec
 
 
 class Error(Exception):
@@ -539,6 +540,47 @@ mkdir -p -- "$HOME/Library/Application Support/$1"
         if result.returncode or status:
             raise Error("File transfer failed")
 
+    def clone(self, source, target):
+        """Called with the lifecycle locks of source and target held."""
+        if self.exists(target) or self.marker(target).exists():
+            raise Error("Target already exists; nothing replaced")
+        src = [v for v in self.machines() if v["Name"] == source and v.get("Source") == "local"]
+        if not src or src[0].get("Running"):
+            raise Error("Clone source must be an existing stopped VM")
+        self.t("clone", source, target)
+        self.marker(target).parent.mkdir(parents=True, exist_ok=True)
+        record = {"name": target, "clean": source, "source": source}
+        if self.marker(source).exists():
+            source_record = json.loads(self.marker(source).read_text())
+            if "panic_reports" in source_record:
+                record["panic_reports"] = source_record["panic_reports"]
+        self.marker(target).write_text(json.dumps(record) + "\n")
+        print("cloned: " + target)
+
+    def install(self, source):
+        src = Path(source).expanduser().resolve()
+        if not src.is_dir() or src.suffix != ".app" or not (src / "Contents/Info.plist").is_file():
+            raise Error("Install expects a built .app bundle with Contents/Info.plist")
+        self.control("quit", src.stem)
+        script = '''set -eu
+staging=$(/usr/bin/mktemp -d /tmp/lampvm-install.XXXXXXXX)
+mkdir -p "$staging/new" "$staging/old"
+/usr/bin/tar -xf - -C "$staging/new"
+[[ ! -e "/Applications/$1" ]] || mv -- "/Applications/$1" "$staging/old/"
+mv -- "$staging/new/$1" /Applications/
+/usr/bin/xattr -cr "/Applications/$1"
+'''
+        self.pipe_tar(src, script, src.name)
+        print("installed: " + src.name)
+
+    def launch(self, app, launch_args=()):
+        path = "/Applications/" + app + ".app"
+        exists = subprocess.run([str(self.tart), "exec", self.name, "/bin/test", "-d", path]).returncode == 0
+        argv = ["/usr/bin/open", "-a", path if exists else app]
+        if launch_args:
+            argv += ["--args", *launch_args]
+        self.guest(*argv)
+
     def recordings_dir(self):
         path = self.state / "recordings"
         path.mkdir(parents=True, exist_ok=True)
@@ -842,6 +884,91 @@ mkdir -p -- "$HOME/Library/Application Support/$1"
             subprocess.run([str(self.tart), "exec", self.name, "/bin/rm", "-f", remote], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def prepare_image(vm, image, wait):
+    """Prepares a spec's image once with setup; later specs naming it reuse it as it is."""
+    name = image["name"]
+    with lock(vm.state / "locks" / ("image-" + name + ".lock"), timeout=86400):
+        if vm.exists(name):
+            record = json.loads(vm.marker(name).read_text()) if vm.marker(name).is_file() else {}
+            if record.get("role") != "clean":
+                raise Error("VM " + name + " exists but is not a prepared lampvm image; choose another image.name")
+            return
+        build = valid_name(name + "-build")
+        print("Preparing image " + name + " from " + image["from"] + "; this happens once per image", flush=True)
+        overlay = vm.state / "run" / ("image-" + name + ".json")
+        overlay.parent.mkdir(parents=True, exist_ok=True)
+        overlay.write_text(json.dumps({k: image[k] for k in ("cpu", "memory", "display") if k in image}) + "\n")
+        argv = [sys.executable, ROOT / "lib/setup.py", "--state-dir", vm.state, "--name", build, "--clean", name,
+                "--keep-config", "--no-build", "--no-download", "--config", overlay, "--wait-slot", str(int(wait)),
+                "--image" if image["oci"] else "--from", image["from"]]
+        run(argv, env={**os.environ, "LAMPVM_TART": str(vm.tart)})
+        # The image is the clean copy; the VM setup prepared it in is not needed again.
+        with locks(vm.state, [build]):
+            vm.t("delete", build)
+            vm.marker(build).unlink()
+        overlay.unlink()
+        print("image ready: " + name, flush=True)
+
+
+def ready_check(vm, check):
+    deadline = time.monotonic() + check["timeout"]
+    if "app" in check:
+        vm.control("wait", check["app"], check["text"], "--timeout", str(check["timeout"]))
+        return "%s shows %r" % (check["app"], check["text"])
+    while True:
+        result = subprocess.run([str(vm.tart), "exec", vm.name, *check["exec"]], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, env={**os.environ, "TART_NO_AUTO_PRUNE": "1"})
+        if result.returncode == 0 and (check["expect"] is None or check["expect"] in result.stdout):
+            return result.stdout.strip()
+        if time.monotonic() >= deadline:
+            raise Error("Not ready: %s gave exit %s%s:\n%s" % (" ".join(check["exec"]), result.returncode,
+                        "" if result.returncode else " without " + repr(check["expect"]), result.stdout.strip()))
+        time.sleep(2)
+
+
+def up(vm, args):
+    if not (args.name or os.environ.get("LAMPVM_NAME")):
+        raise Error("up makes a private VM; name it with --name or LAMPVM_NAME")
+    try:
+        spec = vmspec.load(args.spec)
+    except vmspec.SpecError as error:
+        raise Error(str(error))
+    image = spec["image"]["name"]
+    if vm.name == image:
+        raise Error("The VM name must differ from the spec's image")
+    for path in spec["install"] + [copy["from"] for copy in spec["files"]]:
+        if not Path(path).exists():
+            raise Error("Spec names a host path that does not exist: " + path)
+    if not math.isfinite(args.wait) or not 0 <= args.wait <= 86400:
+        raise Error("--wait must be finite and 0..86400 seconds")
+    if not math.isfinite(args.idle_after) or not 1 <= args.idle_after <= 86400:
+        raise Error("--idle-after must be finite and 1..86400 seconds")
+    session = args.session or os.environ.get("LAMPVM_SESSION")
+    session = valid_session(session) if session else None
+    prepare_image(vm, spec["image"], args.wait)
+    with locks(vm.state, [vm.name, image]):
+        if not vm.exists(vm.name):
+            vm.clone(image, vm.name)
+        else:
+            vm.working()
+            made_from = json.loads(vm.marker().read_text()).get("clean")
+            if made_from != image:
+                raise Error("VM " + vm.name + " was made from " + str(made_from) + ", not " + image + "; use another name")
+    vm.start(args.wait, args.owner, args.idle_after, False, session)
+    vm.ctl = None
+    with locks(vm.state, [vm.name]), Slots(vm.state).activity(vm.name, "up"):
+        for app in spec["install"]:
+            vm.install(app)
+        for copy in spec["files"]:
+            vm.push(copy["from"], copy["to"])
+            print("copied into guest: " + copy["to"], flush=True)
+        if spec["launch"]:
+            vm.launch(spec["launch"])
+        for check in spec["ready"]:
+            print("ready check: " + ready_check(vm, check), flush=True)
+    print("ready: " + vm.name)
+
+
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--name", help="owned VM name (or LAMPVM_NAME)")
@@ -874,6 +1001,12 @@ def parser():
     q.add_argument("--owner", help="free description shown beside holder and ticket")
     q.add_argument("--idle-after", type=float, default=600, help="flag command silence after seconds; never stops the VM")
     q.add_argument("--detach", action="store_true", help="return after queuing instead of when the VM is ready; rerun start without it to wait")
+    q = add("up", "make the VM a spec file describes, from its prepared image, and return when it is ready")
+    q.add_argument("spec", help="JSON spec: image, install, files, launch, ready")
+    q.add_argument("--wait", type=float, default=3600, help="seconds to wait for a VM slot (default 3600)")
+    q.add_argument("--session", help="task or thread id shared by every start of one session (or LAMPVM_SESSION)")
+    q.add_argument("--owner", help="free description shown beside holder and ticket")
+    q.add_argument("--idle-after", type=float, default=600, help="flag command silence after seconds; never stops the VM")
     add("stop", "shut down only the selected owned VM")
     q = add("status", "show all slot holders and durable FIFO queue")
     q.add_argument("--json", action="store_true")
@@ -1034,6 +1167,9 @@ def main():
             raise Error("doctor found problems; see report")
         return
     vm.require_tart()
+    if cmd == "up":
+        up(vm, args)
+        return
     # Recording and waits deliberately release the action lock so another call
     # can cause the change they observe. Captures have unique names on both sides.
     unlocked = cmd in ["start", "view", "record", "wait", "assert", "status", "tree", "find", "windows", "bounds"]
@@ -1116,23 +1252,7 @@ def main():
                         print("  %s: %s %s" % (request['name'], request['phase'], request.get('error', '')))
             return
         if cmd == "clone":
-            target = valid_name(args.target)
-            source = valid_name(args.source or vm.clean)
-            with contextlib.nullcontext():
-                if vm.exists(target) or vm.marker(target).exists():
-                    raise Error("Target already exists; nothing replaced")
-                src = [v for v in vm.machines() if v["Name"] == source and v.get("Source") == "local"]
-                if not src or src[0].get("Running"):
-                    raise Error("Clone source must be an existing stopped VM")
-                vm.t("clone", source, target)
-                vm.marker(target).parent.mkdir(parents=True, exist_ok=True)
-                record = {"name": target, "clean": source, "source": source}
-                if vm.marker(source).exists():
-                    source_record = json.loads(vm.marker(source).read_text())
-                    if "panic_reports" in source_record:
-                        record["panic_reports"] = source_record["panic_reports"]
-                vm.marker(target).write_text(json.dumps(record) + "\n")
-                print("cloned: " + target)
+            vm.clone(valid_name(args.source or vm.clean), valid_name(args.target))
             return
         if cmd == "destroy":
             vm.working()
@@ -1172,29 +1292,9 @@ def main():
             elif cmd == "apps":
                 vm.control("apps")
             elif cmd == "install":
-                src = Path(args.source).expanduser().resolve()
-                if not src.is_dir() or src.suffix != ".app" or not (src / "Contents/Info.plist").is_file():
-                    raise Error("Install expects a built .app bundle with Contents/Info.plist")
-                vm.control("quit", src.stem)
-                script = '''set -eu
-staging=$(/usr/bin/mktemp -d /tmp/lampvm-install.XXXXXXXX)
-mkdir -p "$staging/new" "$staging/old"
-/usr/bin/tar -xf - -C "$staging/new"
-[[ ! -e "/Applications/$1" ]] || mv -- "/Applications/$1" "$staging/old/"
-mv -- "$staging/new/$1" /Applications/
-/usr/bin/xattr -cr "/Applications/$1"
-'''
-                vm.pipe_tar(src, script, src.name)
-                print("installed: " + src.name)
+                vm.install(args.source)
             elif cmd == "launch":
-                app = vm.application(args.app)
-                path = "/Applications/" + app + ".app"
-                exists = subprocess.run([str(vm.tart), "exec", vm.name, "/bin/test", "-d", path]).returncode == 0
-                argv = ["/usr/bin/open", "-a", path if exists else app]
-                launch_args = args.args[1:] if args.args[:1] == ["--"] else args.args
-                if launch_args:
-                    argv += ["--args", *launch_args]
-                vm.guest(*argv)
+                vm.launch(vm.application(args.app), args.args[1:] if args.args[:1] == ["--"] else args.args)
             elif cmd == "quit":
                 vm.control("quit", vm.application(args.app))
             elif cmd == "openrouter":

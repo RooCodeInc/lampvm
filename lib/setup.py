@@ -302,6 +302,9 @@ def main():
     parser.add_argument("--image", help="Public Tart OCI image, preferably @sha256 digest")
     parser.add_argument("--no-download", action="store_true", help="Use an already installed Tart")
     parser.add_argument("--wait-slot", type=int, default=0, help="Wait this many seconds for a free slot; never stop another VM")
+    parser.add_argument("--clean", help="Clean image name to prepare instead of the configured one")
+    parser.add_argument("--no-build", action="store_true", help="Use the helpers already built in the state directory")
+    parser.add_argument("--keep-config", action="store_true", help="Leave runtime config.json as it is, for a prepared image other than the default")
     args = parser.parse_args()
     if args.state_dir:
         STATE = args.state_dir.expanduser().resolve()
@@ -316,7 +319,7 @@ def main():
     config_path = (args.config or Path(os.environ.get("LAMPVM_CONFIG", str(runtime_config)))).expanduser()
     config = load_config(runtime_config, config_path)
     name = valid_name(args.name or os.environ.get("LAMPVM_NAME") or config.get("vm", "lampvm"))
-    clean = valid_name(config.get("clean", name + "-clean"))
+    clean = valid_name(args.clean or config.get("clean", name + "-clean"))
     if clean == name:
         raise RuntimeError("Working and clean VM names must differ")
     config.update(vm=name, clean=clean, image=args.image or config.get("image", IMAGE))
@@ -329,7 +332,10 @@ def main():
     STATE.mkdir(parents=True, exist_ok=True)
     build_env = os.environ.copy()
     build_env["LAMPVM_STATE_DIR"] = str(STATE)
-    run([ROOT / "bin/build"], env=build_env)
+    if not args.no_build:
+        run([ROOT / "bin/build"], env=build_env)
+    elif not (STATE / "bin/vmctl").is_file():
+        raise RuntimeError("The guest helper is not built; run lampvm build")
     with contextlib.ExitStack() as locks:
         lock_names = {name, clean}
         if args.source:
@@ -357,7 +363,8 @@ def main():
             atomic_json(marker, dict(name=name, clean=clean, source=source, phase="cloned"))
         configure_vm(vm, config, fresh=fresh)
         # Save config before starting so failed setup can be inspected and resumed.
-        atomic_json(runtime_config, config)
+        if not args.keep_config:
+            atomic_json(runtime_config, config)
         try:
             vm.start(args.wait_slot)
             # A public/source image can carry historical reports. Preserve them and
