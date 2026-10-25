@@ -53,6 +53,38 @@ $L --name test-my-session destroy --yes
 
 `clone` uses the configured clean VM; `clone NAME --from STOPPED_VM` selects another clean source. Cloning shares disk blocks initially, but changes consume storage. `destroy --yes` deletes only the selected owned working VM. Clean-image ownership records are protected from start, destroy and reset. Use `reset --yes` only on your working VM; it replaces that VM from its recorded stopped clean source, and a running VM comes back running in the slot it held. Do not select the clean image for destructive commands.
 
+## Declare a VM in a spec
+
+Instead of cloning, starting, installing and copying step by step, describe the VM in a JSON file and run `up`. It returns, printing `ready: NAME`, once the VM is running and every ready check has passed:
+
+```sh
+export LAMPVM_NAME="lamp-agent-$(uuidgen | tr '[:upper:]' '[:lower:]')"
+export LAMPVM_SESSION="<your task or thread id>"
+bin/lampvm up specs/xcode27.json --owner "what this run checks"
+bin/lampvm exec /usr/bin/xcodebuild -version   # the VM is ready for commands
+bin/lampvm destroy --yes                       # only your clone; the image stays
+```
+
+```json
+{
+  "image": {"name": "lampvm-xcode27", "from": "ghcr.io/cirruslabs/macos-tahoe-xcode@sha256:71d9…"},
+  "install": ["../build/Lamp Dev.app"],
+  "files": [{"from": "fixtures/made-up-project", "to": "/Users/Shared"}],
+  "launch": "Lamp Dev",
+  "ready": [
+    {"exec": ["/usr/bin/xcodebuild", "-version"], "expect": "Xcode 27"},
+    {"app": "Lamp Dev", "text": "Ready", "timeout": 60}
+  ]
+}
+```
+
+- `image` is the prepared image the VM is cloned from: what is stable and expensive to copy, such as Xcode and its simulators, lives there instead of being pushed into every VM. `from` is a public Tart image pinned by tag or `@sha256` digest, or a stopped local VM; `cpu`, `memory` and `display` are optional. The first `up` naming an image that does not exist yet prepares it once with `setup` (download, guest helper, automation permissions, a stopped clean copy), without changing the default clean image in runtime `config.json` and without rebuilding the shared helpers. Later specs naming it clone it as it is. Change the image by giving it a new `name`.
+- `install` lists host `.app` builds copied into guest `/Applications`, as `install` does; `files` lists host files or folders streamed into guest folders, as `push` does; `launch` opens an app. Host paths are relative to the spec file.
+- `ready` says what "ready" means. `{"exec": [...]}` runs a guest command until it exits 0 (and its output contains `expect`, if given); `{"app": ..., "text": ...}` waits for that text, whatever the app shows once it is ready, in its Accessibility tree. Each check has `timeout` seconds (default 60). A check that never passes fails `up` with its last output and leaves the VM running for inspection.
+- `up` needs a private name (`--name` or `LAMPVM_NAME`), waits for a slot as `start --wait` does (`--wait`, default 3600 seconds) with `--session`, `--owner` and `--idle-after`, and a rerun of the same line resumes: it reuses the VM if it was made from the same image, then installs, copies and checks again. Hold, stop and destroy the VM as any other.
+
+`specs/xcode27.json` uses Cirrus Labs' Tart image with Xcode 27 and its simulators, which they build with Packer from their [macOS image templates](https://github.com/cirruslabs/macos-image-templates). It is a 62 GB download that Tart caches in `~/.tart`, and the prepared image is a 140 GB guest disk. Preparing it waits for a free slot without joining the `start` line, as `setup --wait-slot` does.
+
 ## Share the two running slots
 
 Use the same runtime state directory for sessions sharing the queue. `start --wait`
@@ -236,6 +268,7 @@ Global selection: `--name NAME`, `--config FILE`, `--state-dir DIRECTORY`. Envir
 | `video SOURCE FILE [--condense SECONDS] [--hold SECONDS] [--crop X,Y,W,H] [--width N] [--timeline FILE]` | Cuts a finished recording into a movie worth watching, on the host without a VM: still stretches played fast with a badge, marks drawn as captions, a crop and a width. The report lists the condensed stretches and where each caption falls. |
 | `doctor` | Checks host dependencies, Accessibility and reported guest health, including unfinished Setup Assistant. It does not prove video consent or every interaction. |
 | `start [--wait SECONDS] [--session ID] [--detach]` | Durable FIFO admission, detached boot worker and idle observation. Returns when the VM is ready for commands; rerun to resume the same ticket. `--session` (or `LAMPVM_SESSION`) is the task or thread id `status` groups by; `--owner` is a free description. `--detach` returns once the ticket is saved. |
+| `up SPEC [--wait SECONDS] [--session ID]` | Makes the VM a spec file describes from its prepared image (preparing the image first if it does not exist), installs and copies what the spec lists and returns once its ready checks pass. |
 | `stop` | Shuts down the selected VM, then forces it off if graceful shutdown times out. |
 | `status [--json]` | Shows every local slot holder, activity/holds, worker health and FIFO line, grouped per session (`sessions` in JSON), and each holder's running recordings; includes host lock state if built. |
 | `view [NAME]` | Opens a running VM in a Screen Sharing window on the host for a person to watch or use. Defaults to the selected VM, else the only one running. Takes no lock and records no activity. |
