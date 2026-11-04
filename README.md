@@ -16,10 +16,10 @@ This opens the running VM in a Screen Sharing window on this Mac, with your mous
 
 Requirements: Apple Silicon, host macOS 14 or later, Xcode Command Line Tools (`xcrun swiftc`, `codesign`, `git`), Python 3 and internet access. Install the Command Line Tools if needed with `xcode-select --install`; that command presents a host installer which a person may need to complete. Start with roughly 40 GB of available storage. The default VM uses 4 CPUs and 8 GB RAM; allow more memory for the host. Apple's macOS virtualization limit is two running macOS guests per Mac. On recent macOS releases, Tart may require the host login Keychain to be unlocked when it starts; a locked screen and a locked Keychain are different conditions.
 
-Clone this private repository using host GitHub access. The example uses an authenticated GitHub CLI (`gh`); ordinary `git clone` works too. Then run:
+Clone the repository, then run setup:
 
 ```sh
-gh repo clone RooCodeInc/lampvm
+git clone https://github.com/RooCodeInc/lampvm.git
 cd lampvm
 bin/lampvm setup
 bin/lampvm doctor
@@ -344,7 +344,7 @@ The model comes from `openrouter.model` in `config/lamp.json`; pass `--model ID`
 - The guest's macOS version determines what you can test. A newer host does not make guest-only behaviour match it. Setup defaults to a pinned image digest; if you choose a mutable `latest` tag, it can change. Record `sw_vers` with proof and configure a stable image reference for repeatable runs.
 - Audio/microphone and sign-in flows are outside the default setup. Screen capture consent can recur. Host restart does not automatically restart the VM. SIP-disabled test guests should not hold valuable data.
 - Setup preserves a VM's hardware identity on retries and refuses to create a clean snapshot after new kernel panic reports or a visible restart-error alert. Start/doctor also check for reported guest health problems. OS/virtualization errors need inspection or a different base image; the toolkit does not dismiss those alerts automatically.
-- macOS/Tart licensing applies separately from this toolkit. Source is MIT licensed; Tart is downloaded separately under its own Fair Source licence. See [licence notices](licenses/NOTICE.md). Do not distribute macOS VM disks or private prepared images with the repository.
+- macOS/Tart licensing applies separately from this toolkit. Source is [MIT licensed](LICENSE), copyright 2026 Roo Code, Inc.; Tart is downloaded separately under its own Fair Source licence. See [licence notices](licenses/NOTICE.md). Do not distribute macOS VM disks or private prepared images with the repository.
 - Ownership records are local safeguards. Do not delete and recreate toolkit VMs directly with Tart under the same names, or share a state directory with untrusted processes.
 
 ## Verify toolkit changes
