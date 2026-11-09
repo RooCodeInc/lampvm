@@ -4,6 +4,7 @@ This is a command-line tool for agents that test macOS apps in disposable Tart V
 Read README.md before installing it. The host screen and the user's applications are not test surfaces.
 
 - Never operate another session's VM. Use a private named clone and release only that clone.
+- An accounts VM holds the owner's real sign-ins. Use one only while it is handed to your session (`LAMPVM_SESSION`), never create, grant or destroy one yourself, and never copy its disk.
 - Wait for a slot with `start --wait SECONDS --session TASK_OR_THREAD_ID` and no `--detach`: it returns when the VM is ready for commands, so nothing polls `status`. Use the same session id on every start. If the shell cuts it off, rerun the same line.
 - Keep the VM running under its hold through a rebuild or any pause of a few minutes, and reinstall the new build into it.
 - `stop` or `destroy` only when you are done or away for long: they give the slot up, and `start` after `stop` joins the back of the line.

@@ -31,7 +31,7 @@ Setup downloads pinned Tart 2.32.1, preserves its signed application bundle, ver
 
 Setup and first start finish the pinned image's known English post-update pages through observable controls: defer updates, skip Apple Account sign-in and decline FileVault. The final welcome button uses an explicit Accessibility press because macOS exposes its mouse hit only as the application. Completion requires the assistant to disappear; unfamiliar pages stop with inspection instructions.
 
-The public base image is configured for automation, with user/password `admin`/`admin`, automatic login, passwordless sudo and SIP disabled. It includes Tart's guest agent. This is an isolated test desktop, not a place for real credentials or personal work. Setup prepares guest automation access. macOS can still present unfamiliar first-boot/update or screen capture consent prompts; read `doctor` output and a screenshot if a capture or Accessibility request fails. Confirm the app works before treating setup success as a test result.
+The public base image is configured for automation, with user/password `admin`/`admin`, automatic login, passwordless sudo and SIP disabled. It includes Tart's guest agent. This is an isolated test desktop, not a place for real credentials or personal work; real sign-ins go in an [accounts VM](#sign-in-once-and-hand-the-vm-to-one-agent). Setup prepares guest automation access. macOS can still present unfamiliar first-boot/update or screen capture consent prompts; read `doctor` output and a screenshot if a capture or Accessibility request fails. Confirm the app works before treating setup success as a test result.
 
 Runtime files live under `~/Library/Application Support/lampvm`; VMs and downloaded image cache live under Tart's own `~/.tart`. Compiled tools, logs, screenshots, recordings and VM disks stay outside git. `bin/lampvm build` rebuilds the tools; the lock-state helper targets the host's macOS version rather than one developer's machine.
 
@@ -52,6 +52,32 @@ $L --name test-my-session destroy --yes
 ```
 
 `clone` uses the configured clean VM; `clone NAME --from STOPPED_VM` selects another clean source. Cloning shares disk blocks initially, but changes consume storage. `destroy --yes` deletes only the selected owned working VM. Clean-image ownership records are protected from start, destroy and reset. Use `reset --yes` only on your working VM; it replaces that VM from its recorded stopped clean source, and a running VM comes back running in the slot it held. Do not select the clean image for destructive commands.
+
+## Sign in once and hand the VM to one agent
+
+On-screen work that needs real accounts (a web app you are signed in to, a Mac app with your login) goes in an accounts VM instead of on your own screen. It keeps your sign-ins between runs, and only you open it: its guest has a password only you know, no automatic login, no SSH and no `sudo` without that password, and the guest agent that answers lampvm and `tart exec` runs only once you have signed in. Agents use it only while you have handed it to their session.
+
+```sh
+L=./bin/lampvm
+$L accounts create my-accounts                      # at a terminal: choose the guest password
+$L --name my-accounts start --wait 3600             # comes up at its login window
+$L view my-accounts                                 # sign in as admin, then to the accounts you choose
+$L accounts grant my-accounts --session t_abc123    # at a terminal, with your password: hand it to that one session
+$L accounts revoke my-accounts                      # stops it; it opens again only when you sign in
+```
+
+- `accounts create NAME` clones the clean image (or `--from` another clean source), asks you at the terminal for the guest password twice, waits for a slot and boots it once to lock it down, then stops it. The password goes to the guest on standard input and is not stored on this Mac. It also unlocks the guest's login keychain. Run it yourself, at a terminal. A name that another VM still lists as its clean source is refused, so no `reset` can copy the accounts VM later.
+- `start` returns once the login window is up and prints the next step. Nothing can use the guest until you sign in through `view`: Screen Sharing asks for the password, and so does the guest's login window. Closing the `view` window changes nothing.
+- `accounts grant NAME --session ID` hands the signed-in VM to the session with that task or thread id. It asks for the guest password and the guest checks it, so an agent cannot hand the VM to itself. Every guest command (`exec`, `sh`, `shot`, `clickon`, `push`, `pull`, recording, `hold` and the rest) then works only with `LAMPVM_SESSION` set to that id; any other session is refused with the name of the session holding it. Granting to another session ends the first grant.
+- The grant ends when the VM stops or restarts for any reason: `accounts revoke`, `stop`, a shutdown or a restart from inside the guest (the grant records the guest's boot time). A restarted VM is back at its login window, so handing it over again means signing in again. `accounts revoke` does not wait for the granted session's running commands; stopping the VM ends them.
+- Nothing copies an accounts VM: `clone --from`, `setup --from` and spec images refuse it, and `reset`, `destroy` and `up` do not touch it. `accounts destroy NAME --yes` deletes it with its sign-ins; like `grant`, it needs the VM signed in and asks for the guest password. `accounts list` and `status` show each accounts VM and whom it is handed to.
+- It shares the two running slots like any other VM, so stop it (`accounts revoke`) when the work is done.
+
+What this does not cover:
+
+- Every agent on this Mac runs as your user. The session check on guest commands is a lampvm rule that agents follow; a process that ignores lampvm can still `tart exec` into the VM while you are signed in, or copy its disk under `~/.tart/vms` while it is stopped. What the guest itself enforces is that a booted VM gives nobody a command line until you sign in, and that a signed-in session has no root without your password.
+- FileVault is off in the guest, so the stopped disk is not encrypted. The login keychain is encrypted with your password, but browser cookies that are not kept in the keychain (Safari's, for one) can be read from a copy of the disk.
+- System Integrity Protection stays off, as in every lampvm image, since lampvm grants its helper Accessibility and Screen Recording by writing the guest's permission database. Without a passwordless `sudo`, an agent needs your password before that matters.
 
 ## Declare a VM in a spec
 
@@ -271,12 +297,13 @@ Global selection: `--name NAME`, `--config FILE`, `--state-dir DIRECTORY`. Envir
 | `up SPEC [--wait SECONDS] [--session ID]` | Makes the VM a spec file describes from its prepared image (preparing the image first if it does not exist), installs and copies what the spec lists and returns once its ready checks pass. |
 | `stop` | Shuts down the selected VM, then forces it off if graceful shutdown times out. |
 | `status [--json]` | Shows every local slot holder, activity/holds, worker health and FIFO line, grouped per session (`sessions` in JSON), and each holder's running recordings; includes host lock state if built. |
-| `view [NAME]` | Opens a running VM in a Screen Sharing window on the host for a person to watch or use. Defaults to the selected VM, else the only one running. Takes no lock and records no activity. |
+| `view [NAME]` | Opens a running VM in a Screen Sharing window on the host for a person to watch or use. Defaults to the selected VM, else the only one running. Takes no lock and records no activity. For an accounts VM it gives no password; you type yours. |
 | `cancel-start` | Cancels only the selected owned VM’s queued start. |
 | `hold --seconds N --reason TEXT` / `release-hold` | Declares/clears autonomous guest work; protects it from idle flags. |
 | `apps` | Lists running guest apps with process names, bundle IDs, PIDs and frontmost status. |
 | `ocr [--app APP]` | Reads visible text with offline Apple Vision OCR, including confidence and text boxes in image pixels. App captures include `screenOriginPoints` and `pixelsPerPoint` conversion; boxes have a top-left image origin. |
-| `clone NAME [--from VM]` | Creates a separate working VM from a stopped clean source. |
+| `accounts create NAME` / `grant NAME --session ID` / `revoke NAME` / `destroy NAME --yes` / `list` | A persistent VM for real sign-ins that only its owner opens and hands to one session at a time; see [accounts VMs](#sign-in-once-and-hand-the-vm-to-one-agent). `create` asks for a new guest password; `grant` and `destroy` ask for it again. |
+| `clone NAME [--from VM]` | Creates a separate working VM from a stopped clean source. Never from an accounts VM. |
 | `destroy --yes` | Stops and deletes the selected owned working VM; clean images are protected. |
 | `reset --yes` | Replaces the selected working VM with a fresh clone of the configured clean image. A running VM reboots in the slot it holds and is ready when the command returns; a stopped one stays stopped. |
 | `install PATH` | Copies an app to guest `/Applications`, quits the previous copy and clears copied extended attributes. |
@@ -337,7 +364,7 @@ The model comes from `openrouter.model` in `config/lamp.json`; pass `--model ID`
 ## Limits and security
 
 - The toolkit uses Tart's local control socket/guest agent to execute commands, CoreGraphics events for mouse/keyboard input, Accessibility for inspection, and guest screen capture for images/video. It does not need host screen access or SSH keys.
-- The guest has normal network access. No shared folders or clipboard are enabled, but `exec`, `sh`, `push` and apps can deliberately transfer data. Isolation is not a credentials policy: agents must avoid real sign-ins, keys, tokens, personal data and production accounts.
+- The guest has normal network access. No shared folders or clipboard are enabled, but `exec`, `sh`, `push` and apps can deliberately transfer data. Isolation is not a credentials policy: agents must avoid real sign-ins, keys, tokens, personal data and production accounts in test VMs. Real sign-ins belong only in an accounts VM its owner signed in to and handed over.
 - Accessibility is only as complete as the app makes it. Canvas/custom controls may expose no labels. Duplicate labels need explicit selection. Popovers, menus, multiple windows and overlays can affect hits. Use screenshots and state assertions; a click report alone is not action verification.
 - OCR can help with unlabelled controls, but recognition is approximate. Its boxes refer to the captured image, not screen points; apply the reported crop origin and scale before clicking (`screenX = originX + imageX / scaleX`, likewise for Y). Recordings keep the crop fixed at their start, so keep the app window in place.
 - Typing requires focus. Direct value-setting can be unsupported or behave differently from a user's keystrokes. Presence in the Accessibility tree does not always mean an element is visibly on screen.
