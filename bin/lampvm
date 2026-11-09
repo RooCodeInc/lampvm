@@ -3,6 +3,7 @@
 import argparse
 import contextlib
 import fcntl
+import getpass
 import json
 import math
 import os
@@ -56,6 +57,53 @@ if [[ $why == asked ]]; then print -u2 "This VM's guest helper is older than --g
 exec "$helper" "$@"'''
 RECORDER = r"/vmctl record /tmp/lampvm-[0-9a-f]+\.mov( |$)"
 RECORD_LIMIT = 3600
+
+# A password reaches the guest on standard input and stays there: dscl and security take their
+# commands on standard input too, written by zsh's own `print`, so it is never in any process's
+# arguments, which every process of the same user can read. dscl answers errors in its output.
+GUEST_STDIN = r'''quoted() { local s=${1//\\/\\\\}; print -r -- "\"${s//\"/\\\"}\""; }
+dscl_ok() { local reply; reply=$(print -r -- "$1" | /usr/bin/dscl . 2>&1); [[ $reply != *Error* && $reply != *failed* ]]; }
+authonly() { dscl_ok "authonly $(quoted "$(/usr/bin/id -un)") $(quoted "$1")"; }
+'''
+# An accounts VM holds real sign-ins, so its guest stops trusting whoever can reach it. Run as
+# the guest user with the new password on standard input: changing one's own password with the
+# old one keeps the login keychain and the secure token in step with it.
+ACCOUNTS_PASSWORD = GUEST_STDIN + r'''set -eu
+IFS= read -r new
+dscl_ok "passwd $(quoted "/Users/$(/usr/bin/id -un)") $(quoted "$1") $(quoted "$new")" || { print -u2 'the password was not changed'; exit 1; }
+authonly "$new" || { print -u2 'the new password does not work'; exit 1; }
+if authonly "$1"; then print -u2 'the old password still works'; exit 1; fi
+print -r -- "unlock-keychain -p $(quoted "$new") $(quoted "$HOME/Library/Keychains/login.keychain-db")" | /usr/bin/security -i
+'''
+# Run as root, the last use of the image's passwordless sudo: no automatic login, no SSH, and
+# sudo without a password only for the shutdown `stop` sends.
+ACCOUNTS_ROOT = r'''set -eu
+/usr/bin/defaults delete /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null || true
+/bin/rm -f /etc/kcpassword
+/bin/launchctl disable system/com.openssh.sshd
+/bin/launchctl bootout system/com.openssh.sshd 2>/dev/null || true
+rule=$(/usr/bin/mktemp /etc/sudoers.d/.lampvm.XXXXXX)
+print -r -- "$1 ALL=(root) NOPASSWD: /sbin/shutdown -h now" > "$rule"
+/bin/chmod 440 "$rule"
+/usr/sbin/visudo -cqf "$rule"
+/bin/mv -f "$rule" /etc/sudoers.d/lampvm-shutdown
+for file in /etc/sudoers.d/*(N); do [[ $file == /etc/sudoers.d/lampvm-shutdown ]] || /bin/rm -f "$file"; done
+/usr/bin/sed -i '' '/NOPASSWD/d' /etc/sudoers
+/usr/sbin/visudo -cq
+'''
+# What the guest must show before an accounts VM is handed out. Prints one line per problem, then
+# `audited`; a check that breaks ends the script early, and a missing `audited` counts as a problem.
+ACCOUNTS_AUDIT = r'''set -eu
+user=$(/usr/bin/id -un)
+[[ -z $(/usr/bin/defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null) && ! -e /etc/kcpassword ]] || print 'automatic login is on'
+! /usr/bin/sudo -n /usr/bin/true 2>/dev/null || print 'sudo works without a password'
+! /usr/bin/dscl . -authonly "$user" "$1" >/dev/null 2>&1 || print "the image's default password still works"
+! /usr/bin/nc -z -G 2 127.0.0.1 22 2>/dev/null || print 'SSH is on'
+[[ ! -e /Library/Preferences/com.apple.VNCSettings.txt ]] || print 'Screen Sharing accepts a VNC password'
+print audited
+'''
+# Checks the owner's password inside the guest, read from standard input.
+ACCOUNTS_OWNER = GUEST_STDIN + r'''IFS= read -r password; authonly "$password"'''
 
 
 def timeline_for(movie):
@@ -228,6 +276,68 @@ class VM:
         self.owned()
         if not self.running():
             raise Error("VM isn't running; run lampvm start")
+        self.granted()
+
+    def record(self, name=None):
+        return json.loads(self.marker(name).read_text())
+
+    def write_record(self, record, name=None):
+        partial = self.marker(name).with_suffix(".json." + uuid.uuid4().hex)
+        partial.write_text(json.dumps(record) + "\n")
+        partial.replace(self.marker(name))
+
+    def accounts(self, name=None):
+        try:
+            return self.record(name).get("role") == "accounts"
+        except (OSError, ValueError, AttributeError):
+            return False
+
+    def granted(self):
+        """An accounts VM answers only the one session it was handed to."""
+        if not self.accounts():
+            return
+        grant = self.record().get("grant")
+        session = os.environ.get("LAMPVM_SESSION")
+        if not grant:
+            raise Error("%s is an accounts VM holding real sign-ins and is handed to no session. "
+                        "Its owner hands it over with: lampvm accounts grant %s --session ID" % (self.name, self.name))
+        if session != grant["session"]:
+            raise Error("%s is an accounts VM handed to session %s, not %s. Only that session may use it; "
+                        "its owner revokes with: lampvm accounts revoke %s" % (self.name, grant["session"], session or "(no LAMPVM_SESSION)", self.name))
+        # A restart from inside the guest keeps Tart running, so the guest's own boot time says whether this is the boot it was handed over in.
+        if self.boot_time() != grant.get("boot"):
+            self.end_grant()
+            raise Error("%s restarted since it was handed over, which ends the hand-over. Its owner signs in and grants it again" % self.name)
+
+    def boot_time(self):
+        try:
+            found = subprocess.run([str(self.tart), "exec", self.name, "/usr/sbin/sysctl", "-n", "kern.boottime"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=10)
+        except subprocess.TimeoutExpired:
+            return None
+        return found.stdout.strip() if found.returncode == 0 and found.stdout.strip() else None
+
+    def end_grant(self):
+        if self.accounts():
+            record = self.record()
+            if record.pop("grant", None):
+                self.write_record(record)
+                print("grant ended: " + self.name)
+
+    def unlocked(self):
+        """True once someone has signed in: the guest agent serving `tart exec` runs only in the user's session."""
+        try:
+            return subprocess.run([str(self.tart), "exec", self.name, "/usr/bin/pgrep", "-q", "Dock"], stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL, timeout=5).returncode == 0
+        except subprocess.TimeoutExpired:
+            return False
+
+    def login_window(self):
+        try:
+            address = self.tout("ip", self.name)
+        except Error:
+            return False
+        return bool(re.fullmatch(r"[0-9.]+", address)) and reachable(address, 5900)
 
     def guest(self, *args, **kwargs):
         return self.t("exec", self.name, *args, **kwargs)
@@ -393,6 +503,9 @@ mkdir -p -- "$HOME/Library/Application Support/$1"
             phase = current['phase']
             if phase == 'running':
                 print("running: " + self.name)
+                if self.accounts() and self.record().get("phase") == "ready" and not self.record().get("grant"):
+                    print("%s is an accounts VM: its owner signs in with lampvm view %s, then hands it over with "
+                          "lampvm accounts grant %s --session ID" % (self.name, self.name, self.name))
                 return
             if phase in ('failed', 'expired', 'cancelled', 'stopped'):
                 raise Error("Start " + phase + ": " + current.get('error', 'see status and ' + str(logfile)))
@@ -465,10 +578,18 @@ mkdir -p -- "$HOME/Library/Application Support/$1"
             with logfile.open("wb") as stream:
                 proc = subprocess.Popen([str(self.tart), "run", "--no-graphics", "--no-audio", "--no-clipboard", self.name], stdin=subprocess.DEVNULL, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
         on_launch()
+        # A boot ends any hand-over: the guest comes up locked and its owner signs in again.
+        self.end_grant()
+        locked = self.accounts() and self.record().get("phase") == "ready"
         boot_deadline = time.monotonic() + 120
         while time.monotonic() < boot_deadline:
             if proc is not None and proc.poll() is not None:
                 raise Error("Tart exited during boot; inspect " + str(logfile))
+            if locked:
+                if self.unlocked() or self.login_window():
+                    return
+                time.sleep(1)
+                continue
             try:
                 ready = subprocess.run([str(self.tart), "exec", self.name, "/usr/bin/pgrep", "-q", "Dock"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
             except subprocess.TimeoutExpired:
@@ -485,15 +606,22 @@ mkdir -p -- "$HOME/Library/Application Support/$1"
 
     def stop(self):
         self.owned()
+        self.end_grant()
         if not self.running():
             print("already stopped: " + self.name)
             return
-        subprocess.run([str(self.tart), "exec", self.name, "/usr/bin/sudo", "-n", "/sbin/shutdown", "-h", "now"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        for _ in range(40):
-            if not self.running():
-                print("stopped: " + self.name)
-                return
-            time.sleep(1)
+        # A locked accounts VM has no guest agent to ask, and nothing unsaved at its login window.
+        if not self.accounts() or self.unlocked():
+            try:
+                subprocess.run([str(self.tart), "exec", self.name, "/usr/bin/sudo", "-n", "/sbin/shutdown", "-h", "now"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+            except subprocess.TimeoutExpired:
+                pass
+            for _ in range(40):
+                if not self.running():
+                    print("stopped: " + self.name)
+                    return
+                time.sleep(1)
         self.t("stop", self.name)
         print("stopped (forced): " + self.name)
 
@@ -508,17 +636,28 @@ mkdir -p -- "$HOME/Library/Application Support/$1"
             if len(running) > 1:
                 raise Error("More than one VM is running. Choose one:\n" + "\n".join("  lampvm view " + name for name in running))
             self.name = running[0]
-        self.need()
+        # A person looking needs no hand-over: that is how the owner signs in.
+        self.owned()
+        if not self.running():
+            raise Error("VM isn't running; run lampvm start")
         address = self.tout("ip", self.name)
         if not re.fullmatch(r"[0-9.]+", address):
             raise Error("Tart reported no usable address for " + self.name)
         if not reachable(address, 5900):
             raise Error("Screen Sharing is off in this guest (port 5900 closed); enable it in the guest's Sharing settings")
         user, password = self.config.get("user", "admin"), self.config.get("password", "admin")
-        run(["/usr/bin/open", "vnc://%s:%s@%s" % (user, password, address)])
+        accounts = self.accounts()
+        run(["/usr/bin/open", "vnc://%s@%s" % (user, address) if accounts else "vnc://%s:%s@%s" % (user, password, address)])
         helper = self.state / "bin/lockstate"
         if helper.exists() and output([helper]) == "locked":
             print("This Mac's screen is locked; the window appears once you unlock it.")
+        if accounts:
+            grant = self.record().get("grant")
+            print("Opening accounts VM %s in Screen Sharing. If it asks for a type, keep Standard and click Continue.\n"
+                  "Sign in as %s with the password you chose at accounts create, in Screen Sharing and at the guest's login window.\n"
+                  "%s Closing the window changes nothing; lampvm accounts revoke %s ends access." % (
+                      self.name, user, "Handed to session %s." % grant["session"] if grant else "Handed to no session.", self.name))
+            return
         print("Opening %s in Screen Sharing. If it asks for a type, keep Standard and click Continue.\n"
               "Guest login if asked: %s / %s. You share one pointer and keyboard with the agent using this VM.\n"
               "Close the window when done; the VM keeps running." % (self.name, user, password))
@@ -544,6 +683,8 @@ mkdir -p -- "$HOME/Library/Application Support/$1"
         """Called with the lifecycle locks of source and target held."""
         if self.exists(target) or self.marker(target).exists():
             raise Error("Target already exists; nothing replaced")
+        if self.accounts(source):
+            raise Error(source + " is an accounts VM holding real sign-ins; nothing is ever cloned from it")
         src = [v for v in self.machines() if v["Name"] == source and v.get("Source") == "local"]
         if not src or src[0].get("Running"):
             raise Error("Clone source must be an existing stopped VM")
@@ -951,6 +1092,8 @@ def up(vm, args):
             vm.clone(image, vm.name)
         else:
             vm.working()
+            if vm.accounts():
+                raise Error(vm.name + " is an accounts VM holding real sign-ins; up never installs into it")
             made_from = json.loads(vm.marker().read_text()).get("clean")
             if made_from != image:
                 raise Error("VM " + vm.name + " was made from " + str(made_from) + ", not " + image + "; use another name")
@@ -967,6 +1110,149 @@ def up(vm, args):
         for check in spec["ready"]:
             print("ready check: " + ready_check(vm, check), flush=True)
     print("ready: " + vm.name)
+
+
+def person(command):
+    # Only the person who owns the sign-ins chooses the password and whom the VM is handed to.
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raise Error("accounts %s is for the VM's owner at a terminal, not for an agent" % command)
+
+
+def accounts_audit(vm):
+    default = vm.config.get("password", "admin")
+    found = subprocess.run([str(vm.tart), "exec", vm.name, "/bin/zsh", "-c", ACCOUNTS_AUDIT, "lampvm", default],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=60).stdout.splitlines()
+    problems = [line for line in found if line.strip() and line != "audited"]
+    return problems if "audited" in found else problems + ["the guest check did not finish"]
+
+
+def owner_password(vm, command):
+    """The owner proves who they are with the guest password, checked by the guest itself."""
+    person(command)
+    if not vm.running():
+        raise Error("%s is stopped. Start it, sign in with lampvm view %s, then %s" % (vm.name, vm.name, command))
+    if not vm.unlocked():
+        raise Error("%s is at its login window. Sign in with lampvm view %s, then %s" % (vm.name, vm.name, command))
+    password = getpass.getpass("Password of %s's guest user: " % vm.name)
+    checked = subprocess.run([str(vm.tart), "exec", "-i", vm.name, "/bin/zsh", "-c", ACCOUNTS_OWNER],
+                             input=password + "\n", text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+    if checked.returncode:
+        time.sleep(3)  # Guessing costs time.
+        raise Error("That is not %s's guest password; nothing changed" % vm.name)
+
+
+def accounts_list(vm):
+    found = []
+    for marker in sorted((vm.state / "vms").glob("*.json")):
+        name = marker.stem
+        if vm.accounts(name):
+            record = vm.record(name)
+            found.append({"name": name, "phase": record.get("phase"), "running": any(
+                v["Name"] == name and v.get("Running") for v in vm.machines() if v.get("Source") == "local"),
+                "grant": None})
+            found[-1]["grant"] = record.get("grant") if found[-1]["running"] else None
+    return found
+
+
+def accounts(vm, args):
+    sub = args.accounts_command
+    if sub == "list":
+        found = accounts_list(vm)
+        for entry in found:
+            grant = entry["grant"]
+            print("%s | %s | %s" % (entry["name"], "running" if entry["running"] else "stopped",
+                  "not ready: " + str(entry["phase"]) if entry["phase"] != "ready" else
+                  "handed to session %s since %s" % (grant["session"], time.strftime("%Y-%m-%d %H:%M", time.localtime(grant["granted_at"])))
+                  if grant else "handed to no session"))
+        if not found:
+            print("no accounts VMs")
+        return
+    vm.name = valid_name(args.vm)
+    user = vm.config.get("user", "admin")
+    if sub == "create":
+        person("create")
+        source = valid_name(args.source or vm.clean)
+        if vm.exists(vm.name) or vm.marker().exists():
+            raise Error("Target already exists; nothing replaced")
+        for marker in (vm.state / "vms").glob("*.json"):
+            with contextlib.suppress(OSError, ValueError, AttributeError):
+                if vm.name in (vm.record(marker.stem).get("clean"), vm.record(marker.stem).get("source")):
+                    raise Error("%s names %s as its source, so reset could copy it; choose another name" % (marker.stem, vm.name))
+        password = getpass.getpass("Password for %s's user %s, which only you will know: " % (vm.name, user))
+        if getpass.getpass("Same password again: ") != password:
+            raise Error("The passwords differ; nothing created")
+        if len(password) < 8 or password == vm.config.get("password", "admin") or "\n" in password:
+            raise Error("Choose a password of at least 8 characters other than the image's; nothing created")
+        with locks(vm.state, [vm.name, source]):
+            vm.clone(source, vm.name)
+            record = vm.record()
+            record.update(role="accounts", phase="hardening")
+            vm.write_record(record)
+        session = os.environ.get("LAMPVM_SESSION")
+        vm.start(args.wait, "accounts VM setup", 600, False, valid_session(session) if session else None)
+        with locks(vm.state, [vm.name]):
+            with Slots(vm.state).activity(vm.name, "accounts"):
+                deadline = time.monotonic() + 120
+                while not vm.unlocked():
+                    if time.monotonic() > deadline:
+                        raise Error("The guest agent never answered; %s is left running for inspection" % vm.name)
+                    time.sleep(1)
+                vm.t("exec", "-i", vm.name, "/bin/zsh", "-c", ACCOUNTS_PASSWORD, "lampvm", vm.config.get("password", "admin"),
+                     input=password + "\n", text=True)
+                vm.guest("/usr/bin/sudo", "-n", "/bin/zsh", "-c", ACCOUNTS_ROOT, "lampvm", user)
+                problems = accounts_audit(vm)
+                if problems:
+                    raise Error("; ".join(problems) + "; %s is left running for inspection" % vm.name)
+                record = vm.record()
+                record["phase"] = "ready"
+                vm.write_record(record)
+            Slots(vm.state).cancel(vm.name)
+            vm.stop()
+            Slots(vm.state).stopped(vm.name)
+        print("accounts VM ready: %s. It stays stopped until you start it, and comes up at its login window.\n"
+              "  lampvm --name %s start --wait 3600\n  lampvm view %s      # sign in, then sign in to the accounts you choose\n"
+              "  lampvm accounts grant %s --session ID\n  lampvm accounts revoke %s" % ((vm.name,) * 5))
+        return
+    vm.owned()
+    if not vm.accounts():
+        raise Error(vm.name + " is not an accounts VM")
+    if sub == "grant":
+        session = valid_session(args.session)
+        if vm.record().get("phase") != "ready":
+            raise Error(vm.name + " was never finished by accounts create; destroy it with lampvm accounts destroy")
+        owner_password(vm, "grant")
+        with locks(vm.state, [vm.name]):
+            boot = vm.boot_time()
+            if not boot:
+                raise Error("%s did not report its boot time; not handed over" % vm.name)
+            problems = accounts_audit(vm)
+            if problems:
+                raise Error("; ".join(problems) + "; not handed over")
+            record = vm.record()
+            previous = record.get("grant")
+            record["grant"] = {"session": session, "granted_at": time.time(), "boot": boot}
+            vm.write_record(record)
+        if previous and previous["session"] != session:
+            print("grant ended: session " + previous["session"])
+        print("handed %s to session %s until lampvm accounts revoke %s or the VM stops" % (vm.name, session, vm.name))
+        return
+    if sub == "revoke":
+        # No lock: a long command of the granted session holds it, and must not keep the owner from revoking.
+        vm.end_grant()
+        Slots(vm.state).cancel(vm.name)
+        vm.stop()
+        Slots(vm.state).stopped(vm.name)
+        print("revoked: %s is stopped; it opens again only after its owner signs in" % vm.name)
+        return
+    if sub == "destroy":
+        owner_password(vm, "destroy")
+        with locks(vm.state, [vm.name]):
+            Slots(vm.state).cancel(vm.name)
+            vm.stop()
+            Slots(vm.state).stopped(vm.name)
+            vm.t("delete", vm.name)
+            vm.marker().unlink()
+        print("deleted with its sign-ins: " + vm.name)
 
 
 def parser():
@@ -1019,6 +1305,21 @@ def parser():
     add("release-hold", "clear selected VM's declared hold")
     add("apps", "list guest applications and their process names")
     app_option(add("ocr", "read visible text and image coordinates with offline Vision OCR"))
+    q = add("accounts", "a persistent VM holding real sign-ins, handed to one session at a time")
+    accounts_sub = q.add_subparsers(dest="accounts_command", required=True)
+    q = accounts_sub.add_parser("create", help="clone a clean VM, set your password and lock it down; at a terminal")
+    q.add_argument("vm")
+    q.add_argument("--from", dest="source", help="clean source; defaults to the configured clean copy")
+    q.add_argument("--wait", type=float, default=3600, help="seconds to wait for a VM slot")
+    q = accounts_sub.add_parser("grant", help="hand a signed-in accounts VM to one session; at a terminal")
+    q.add_argument("vm")
+    q.add_argument("--session", required=True, help="the task or thread id of the agent session")
+    q = accounts_sub.add_parser("revoke", help="end the hand-over and stop the VM; it opens again only after you sign in")
+    q.add_argument("vm")
+    q = accounts_sub.add_parser("destroy", help="delete an accounts VM with its sign-ins; at a terminal")
+    q.add_argument("vm")
+    q.add_argument("--yes", action="store_true", required=True)
+    accounts_sub.add_parser("list", help="list accounts VMs and whom each is handed to")
     q = add("clone", "make a private stopped VM from a stopped source")
     q.add_argument("target")
     q.add_argument("--from", dest="source", help="source VM; defaults to configured clean copy")
@@ -1156,6 +1457,7 @@ def main():
         if not vm.tart.is_file():
             problems.append("Tart is missing")
         elif vm.running():
+            vm.granted()
             try:
                 checks["accessibility"] = vm.control("trusted", capture=True)
                 problems.extend(vm.health())
@@ -1170,12 +1472,18 @@ def main():
     if cmd == "up":
         up(vm, args)
         return
+    if cmd == "accounts":
+        accounts(vm, args)
+        return
     # Recording and waits deliberately release the action lock so another call
     # can cause the change they observe. Captures have unique names on both sides.
     unlocked = cmd in ["start", "view", "record", "wait", "assert", "status", "tree", "find", "windows", "bounds"]
     lifecycle_names = [vm.name]
     if cmd == "clone":
         lifecycle_names = [valid_name(args.target), valid_name(args.source or vm.clean)]
+    if cmd in ("reset", "destroy") and vm.marker().is_file() and vm.accounts():
+        raise Error("%s is an accounts VM holding real sign-ins; %s never touches it. Its owner deletes it with lampvm accounts destroy %s --yes"
+                    % (vm.name, cmd, vm.name))
     if cmd == "reset":
         vm.working()
         lifecycle_names += [valid_name(json.loads(vm.marker().read_text()).get("clean", vm.clean))]
@@ -1217,6 +1525,7 @@ def main():
             recordings = vm.recordings()
             for holder in report['holders']:
                 holder['recordings'] = [r for r in recordings if r['vm'] == holder['name']]
+            report['accounts'] = accounts_list(vm)
             helper = vm.state / "bin/lockstate"
             if helper.exists():
                 report['host_screen'] = output([helper])
@@ -1250,6 +1559,11 @@ def main():
                 for request in report['requests']:
                     if request['phase'] in ('booting', 'failed', 'expired', 'cancelled'):
                         print("  %s: %s %s" % (request['name'], request['phase'], request.get('error', '')))
+                if report['accounts']:
+                    print("Accounts VMs:")
+                for entry in report['accounts']:
+                    print("  %s | %s | %s" % (entry['name'], "running" if entry['running'] else "stopped",
+                          "handed to session " + entry['grant']['session'] if entry['grant'] else "handed to no session"))
             return
         if cmd == "clone":
             vm.clone(valid_name(args.source or vm.clean), valid_name(args.target))
@@ -1268,6 +1582,8 @@ def main():
             clean = valid_name(json.loads(vm.marker().read_text()).get("clean", vm.clean))
             if clean == vm.name:
                 raise Error("Clean copy and working VM must differ")
+            if vm.accounts(clean):
+                raise Error(clean + " is an accounts VM holding real sign-ins; nothing is ever reset from it")
             source = [v for v in vm.machines() if v["Name"] == clean and v.get("Source") == "local"]
             if not source or source[0].get("Running"):
                 raise Error("Clean copy must exist and be stopped")

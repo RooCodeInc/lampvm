@@ -85,8 +85,17 @@ def check_owned(vm, name, marker, *, clean_source=None):
         record = {}
     if not isinstance(record, dict) or record.get("name") != name:
         raise RuntimeError("VM " + name + " exists and is not owned by this lampvm state; choose a different name")
+    if record.get("role") == "accounts":
+        raise RuntimeError("VM " + name + " is an accounts VM holding real sign-ins; setup never prepares or images it")
     if clean_source and (record.get("role") != "clean" or record.get("source") != clean_source):
         raise RuntimeError("Clean VM " + name + " does not belong to working VM " + clean_source + "; choose another clean name")
+
+
+def accounts_vm(name):
+    try:
+        return json.loads((STATE / "vms" / (name + ".json")).read_text()).get("role") == "accounts"
+    except (OSError, ValueError, AttributeError):
+        return False
 
 
 @contextlib.contextmanager
@@ -356,6 +365,8 @@ def main():
             raise RuntimeError("--from must name an existing stopped local VM")
         if args.source == name:
             raise RuntimeError("--from must differ from the destination VM")
+        if args.source and accounts_vm(args.source):
+            raise RuntimeError("--from names an accounts VM holding real sign-ins; images are never made from one")
         fresh = not vm.exists(name)
         if fresh:
             print("Cloning " + source + " into " + name + " (first image download is about 30 GB)", flush=True)
