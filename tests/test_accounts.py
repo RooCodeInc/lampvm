@@ -1,6 +1,9 @@
 """An accounts VM holds real sign-ins: nothing copies it, and only the session it was handed to uses it."""
 import importlib.util
 import json
+import os
+import subprocess
+import tempfile
 from pathlib import Path
 import unittest
 from unittest import mock
@@ -120,3 +123,36 @@ class AccountsVMTests(IsolatedState, unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PasswordNeverInArgvTests(IsolatedState, unittest.TestCase):
+    """Runs the guest scripts that check or set the owner's password, with dscl and security
+    replaced by a recorder of the arguments and input each call received. Arguments show in the
+    guest's process table to any process of the same user; input does not."""
+
+    def calls(self, script, args, password):
+        recorder = self.state / "recorder"
+        log = self.state / "calls.jsonl"
+        recorder.write_text("#!/usr/bin/python3 -I\nimport json, sys\nwith open(%r, 'a') as f:\n"
+                            "    f.write(json.dumps({'argv': sys.argv[1:], 'stdin': sys.stdin.read()}) + '\\n')\n" % str(log))
+        recorder.chmod(0o755)
+        script = script.replace("/usr/bin/dscl", str(recorder)).replace("/usr/bin/security", str(recorder))
+        with tempfile.TemporaryDirectory(prefix="lampvm-argv-") as home:
+            subprocess.run(["/bin/zsh", "-c", script, "lampvm", *args], input=password + "\n", text=True, timeout=30,
+                           env={"PATH": "/usr/bin:/bin", "USER": "made-up-user", "HOME": home},
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+
+    def check(self, script, args):
+        password = 'made up "pass" \\ word'
+        calls = self.calls(script, args, password)
+        self.assertTrue(calls, "the script never reached dscl")
+        self.assertEqual([c["argv"] for c in calls if any(password in a for a in c["argv"])], [])
+        self.assertTrue(any(password.replace("\\", "\\\\").replace('"', '\\"') in c["stdin"] for c in calls),
+                        "the password never reached dscl's input")
+
+    def test_checking_the_owner_password_keeps_it_out_of_arguments(self):
+        self.check(cli.ACCOUNTS_OWNER, [])
+
+    def test_setting_the_owner_password_keeps_it_out_of_arguments(self):
+        self.check(cli.ACCOUNTS_PASSWORD, ["admin"])

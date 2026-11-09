@@ -58,15 +58,22 @@ exec "$helper" "$@"'''
 RECORDER = r"/vmctl record /tmp/lampvm-[0-9a-f]+\.mov( |$)"
 RECORD_LIMIT = 3600
 
+# A password reaches the guest on standard input and stays there: dscl and security take their
+# commands on standard input too, written by zsh's own `print`, so it is never in any process's
+# arguments, which every process of the same user can read. dscl answers errors in its output.
+GUEST_STDIN = r'''quoted() { local s=${1//\\/\\\\}; print -r -- "\"${s//\"/\\\"}\""; }
+dscl_ok() { local reply; reply=$(print -r -- "$1" | /usr/bin/dscl . 2>&1); [[ $reply != *Error* && $reply != *failed* ]]; }
+authonly() { dscl_ok "authonly $(quoted "$(/usr/bin/id -un)") $(quoted "$1")"; }
+'''
 # An accounts VM holds real sign-ins, so its guest stops trusting whoever can reach it. Run as
 # the guest user with the new password on standard input: changing one's own password with the
 # old one keeps the login keychain and the secure token in step with it.
-ACCOUNTS_PASSWORD = r'''set -eu
+ACCOUNTS_PASSWORD = GUEST_STDIN + r'''set -eu
 IFS= read -r new
-/usr/bin/dscl . -passwd "/Users/$USER" "$1" "$new"
-/usr/bin/dscl . -authonly "$USER" "$new" >/dev/null
-if /usr/bin/dscl . -authonly "$USER" "$1" >/dev/null 2>&1; then print -u2 'the old password still works'; exit 1; fi
-/usr/bin/security unlock-keychain -p "$new" "$HOME/Library/Keychains/login.keychain-db"
+dscl_ok "passwd $(quoted "/Users/$(/usr/bin/id -un)") $(quoted "$1") $(quoted "$new")" || { print -u2 'the password was not changed'; exit 1; }
+authonly "$new" || { print -u2 'the new password does not work'; exit 1; }
+if authonly "$1"; then print -u2 'the old password still works'; exit 1; fi
+print -r -- "unlock-keychain -p $(quoted "$new") $(quoted "$HOME/Library/Keychains/login.keychain-db")" | /usr/bin/security -i
 '''
 # Run as root, the last use of the image's passwordless sudo: no automatic login, no SSH, and
 # sudo without a password only for the shutdown `stop` sends.
@@ -96,7 +103,7 @@ user=$(/usr/bin/id -un)
 print audited
 '''
 # Checks the owner's password inside the guest, read from standard input.
-ACCOUNTS_OWNER = r'''IFS= read -r password; exec /usr/bin/dscl . -authonly "$(/usr/bin/id -un)" "$password" >/dev/null 2>&1'''
+ACCOUNTS_OWNER = GUEST_STDIN + r'''IFS= read -r password; authonly "$password"'''
 
 
 def timeline_for(movie):
@@ -1130,6 +1137,7 @@ def owner_password(vm, command):
     checked = subprocess.run([str(vm.tart), "exec", "-i", vm.name, "/bin/zsh", "-c", ACCOUNTS_OWNER],
                              input=password + "\n", text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
     if checked.returncode:
+        time.sleep(3)  # Guessing costs time.
         raise Error("That is not %s's guest password; nothing changed" % vm.name)
 
 
