@@ -193,6 +193,38 @@ class CLISafetyTests(IsolatedState, unittest.TestCase):
                 cli.valid_name(name)
 
 
+class ListingTests(IsolatedState, unittest.TestCase):
+    """`tart list` racing another session's `tart delete` (seen 2026-11-18 with Tart 2.32.1)."""
+
+    def fake_list(self, failures):
+        # Fails like Tart does when a VM folder vanishes mid-listing, then lists normally.
+        tart = self.state / "fake-tart"
+        tart.write_text("#!/bin/sh\n"
+                        "count=$(cat \"$0.count\" 2>/dev/null || echo 0); echo $((count + 1)) > \"$0.count\"\n"
+                        "if [ \"$count\" -lt %d ]; then\n"
+                        "  echo 'Error: The file \u201cconfig.json\u201d couldn\u2019t be opened because there is no such file.' >&2; exit 1\n"
+                        "fi\n"
+                        "echo '[{\"Name\": \"private-test\", \"Source\": \"local\", \"Running\": false}]'\n" % failures)
+        tart.chmod(0o755)
+        return tart
+
+    def test_listing_that_races_a_delete_is_retried(self):
+        tart = self.fake_list(failures=3)
+        vm = self.vm()
+        with mock.patch.object(cli.time, "sleep"), contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(vm.exists("private-test"))
+        self.assertEqual(Path(str(tart) + ".count").read_text().strip(), "4")
+
+    def test_listing_that_keeps_failing_still_fails(self):
+        self.fake_list(failures=1000)
+        vm = self.vm()
+        stderr = io.StringIO()
+        with mock.patch.object(cli.time, "sleep"), contextlib.redirect_stderr(stderr):
+            with self.assertRaisesRegex(cli.Error, "command failed"):
+                vm.machines()
+        self.assertIn("config.json", stderr.getvalue())
+
+
 class ViewTests(IsolatedState, unittest.TestCase):
     def own(self, vm, *names):
         vm.marker().parent.mkdir(exist_ok=True)

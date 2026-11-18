@@ -1,5 +1,6 @@
 """Safety checks that never boot a VM or reach the network."""
 import contextlib
+import io
 import importlib.util
 import json
 from pathlib import Path
@@ -10,6 +11,20 @@ from unittest.mock import MagicMock, patch
 spec = importlib.util.spec_from_file_location("lampvm_setup", Path(__file__).resolve().parents[1] / "lib/setup.py")
 setup = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(setup)
+
+
+class SetupListing(unittest.TestCase):
+    def test_listing_that_races_a_delete_is_retried(self):
+        # Tart fails a listing like this when another session deletes a VM while it lists.
+        with tempfile.TemporaryDirectory() as temporary:
+            tart = Path(temporary) / "tart"
+            tart.write_text("#!/bin/sh\n"
+                            "count=$(cat \"$0.count\" 2>/dev/null || echo 0); echo $((count + 1)) > \"$0.count\"\n"
+                            "if [ \"$count\" -lt 2 ]; then echo 'Error: The file \u201cconfig.json\u201d couldn\u2019t be opened because there is no such file.' >&2; exit 1; fi\n"
+                            "echo '[{\"Name\": \"lampvm-clean\", \"Source\": \"local\", \"Running\": false}]'\n")
+            tart.chmod(0o755)
+            with patch("time.sleep"), contextlib.redirect_stderr(io.StringIO()):
+                self.assertTrue(setup.VM(tart, "lampvm").exists("lampvm-clean"))
 
 
 class SetupSafety(unittest.TestCase):

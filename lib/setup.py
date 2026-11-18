@@ -20,6 +20,7 @@ import urllib.request
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 from bootstrap import complete_desktop
+from tartlist import tart_list
 STATE = Path(os.environ.get("LAMPVM_STATE_DIR", str(Path.home() / "Library/Application Support/lampvm"))).expanduser()
 VERSION = "2.32.1"
 TART_SHA256 = "8554ab4f7fc12afe52f9b7e3093a935673cbac737a83973d2db7a0683c814529"
@@ -169,7 +170,7 @@ class VM:
         return run([self.tart, *args], **kwargs)
 
     def all(self):
-        return json.loads(capture([self.tart, "list", "--format", "json"]))
+        return tart_list(self.tart)
 
     def exists(self, name):
         return any(v["Name"] == name and v.get("Source") == "local" for v in self.all())
