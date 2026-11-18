@@ -21,6 +21,7 @@ sys.path.insert(0, str(ROOT / "lib"))
 from bootstrap import complete_desktop
 from slots import Slots, flock_file
 import vmspec
+from tartlist import tart_list
 
 
 class Error(Exception):
@@ -249,7 +250,11 @@ class VM:
         return output([self.tart, *args])
 
     def machines(self):
-        return json.loads(self.tout("list", "--format", "json"))
+        self.require_tart()
+        try:
+            return tart_list(self.tart)
+        except subprocess.CalledProcessError as error:
+            raise Error("command failed (exit %s)" % error.returncode)
 
     def exists(self, name):
         return any(v["Name"] == name and v.get("Source") == "local" for v in self.machines())
